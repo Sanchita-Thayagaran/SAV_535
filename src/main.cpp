@@ -7,7 +7,7 @@ int main()
 {
   Simulator sim;
 
-  std::cout << "CS535 Memory/Cache Demo\n";
+  std::cout << "CS535 Memory/Cache + Pipeline Simulator\n";
   std::cout << sim.handleHelp() << "\n";
   std::cout << "Initial state: RAM is zero-initialized, cache lines invalid.\n";
 
@@ -29,6 +29,9 @@ int main()
     std::string cmd;
     iss >> cmd;
 
+    // ----------------------
+    // Exit / Help
+    // ----------------------
     if (cmd == "Q" || cmd == "q")
     {
       std::cout << "Exiting.\n";
@@ -41,12 +44,18 @@ int main()
       continue;
     }
 
+    // ----------------------
+    // Status
+    // ----------------------
     if (cmd == "S" || cmd == "s")
     {
       std::cout << sim.handleStatus() << "\n";
       continue;
     }
 
+    // ----------------------
+    // View (cache / RAM)
+    // ----------------------
     if (cmd == "V" || cmd == "v")
     {
       int level;
@@ -60,6 +69,9 @@ int main()
       continue;
     }
 
+    // ----------------------
+    // Read
+    // ----------------------
     if (cmd == "R" || cmd == "r")
     {
       Address addr;
@@ -73,6 +85,9 @@ int main()
       continue;
     }
 
+    // ----------------------
+    // Write
+    // ----------------------
     if (cmd == "W" || cmd == "w")
     {
       Word value;
@@ -87,6 +102,55 @@ int main()
       continue;
     }
 
+    // =====================================================
+    // DEMO 2 (PIPELINE) COMMANDS
+    // =====================================================
+
+    if (cmd == "LOADPROG")
+    {
+      std::string file;
+      if (!(iss >> file))
+      {
+        std::cout << "ERROR: usage LOADPROG <file>\n";
+        continue;
+      }
+      std::cout << sim.loadProgram(file) << "\n";
+      continue;
+    }
+
+    if (cmd == "STEP")
+    {
+      std::cout << sim.step() << "\n";
+      continue;
+    }
+
+    if (cmd == "RUN")
+    {
+      std::cout << sim.run() << "\n";
+      continue;
+    }
+
+    if (cmd == "REGS")
+    {
+      std::cout << sim.dumpRegs() << "\n";
+      continue;
+    }
+
+    if (cmd == "MEMRANGE")
+    {
+      Address start, count;
+      if (!(iss >> start >> count))
+      {
+        std::cout << "ERROR: usage MEMRANGE <start> <count>\n";
+        continue;
+      }
+      std::cout << sim.dumpMemoryRange(start, count) << "\n";
+      continue;
+    }
+
+    // ----------------------
+    // Unknown command
+    // ----------------------
     std::cout << "ERROR: unknown command. Type H for help.\n";
   }
 

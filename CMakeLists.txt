@@ -9,6 +9,8 @@ add_executable(CS535Demo
     src/Memory.cpp
     src/Cache.cpp
     src/Simulator.cpp
+    src/Parser.cpp
+    src/Instruction.cpp
 )
 
 target_include_directories(CS535Demo PRIVATE src)
