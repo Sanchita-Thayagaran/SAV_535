@@ -2,6 +2,7 @@
 #include "Cache.h"
 #include "Memory.h"
 #include "Instruction.h"
+#include "UI.h"
 #include <string>
 #include <vector>
 #include <array>
@@ -23,6 +24,7 @@ public:
     Simulator();
 
     void reset();
+    
 
     std::string handleRead(Address address, Stage stage);
     std::string handleWrite(Word value, Address address, Stage stage);
@@ -74,4 +76,7 @@ private:
 
     std::string stageToString(const PipeReg& preg, const std::string& name) const;
     std::string lastEvent_;
+
+    void initializeMemoryData();
+    UI::ExecutionStats execStats_;
 };

@@ -11,6 +11,7 @@ add_executable(CS535Demo
     src/Simulator.cpp
     src/Parser.cpp
     src/Instruction.cpp
+    src/UI.cpp
 )
 
 target_include_directories(CS535Demo PRIVATE src)

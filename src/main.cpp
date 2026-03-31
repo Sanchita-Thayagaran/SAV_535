@@ -2,6 +2,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include "UI.h"
 
 int main()
 {
@@ -49,7 +50,7 @@ int main()
     // ----------------------
     if (cmd == "S" || cmd == "s")
     {
-      std::cout << sim.handleStatus() << "\n";
+      std::cout << UI::prettyPrint(sim.handleStatus()) << "\n";
       continue;
     }
 
@@ -120,13 +121,13 @@ int main()
 
     if (cmd == "STEP")
     {
-      std::cout << sim.step() << "\n";
+      std::cout << UI::prettyPrint(sim.step()) << "\n";
       continue;
     }
 
     if (cmd == "RUN")
     {
-      std::cout << sim.run() << "\n";
+      std::cout << UI::prettyPrint(sim.run()) << "\n";
       continue;
     }
 
