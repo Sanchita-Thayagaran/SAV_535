@@ -1,43 +1,50 @@
 #include "Simulator.h"
 #include "Parser.h"
-#include <sstream>
+#include "UI.h"
+
+#include <iomanip>
 #include <iostream>
+#include <sstream>
 
 Simulator::Simulator() : memory_(), cache_(memory_) {
     reset();
 }
 
 void Simulator::reset() {
-  memory_.reset();
-  cache_.reset();
+    memory_.reset();
+    cache_.reset();
 
-  cycles_ = 0;
-  pc_ = 0;
-  halted_ = false;
-  squash_ = false;
-  branchTarget_ = 0;
-  memStall_ = false;
-  memAccessType_ = AccessType::READ_LINE;
+    cycles_ = 0;
+    pc_ = 0;
+    halted_ = false;
+    squash_ = false;
+    branchTarget_ = 0;
+    memStall_ = false;
+    memAccessType_ = AccessType::READ_LINE;
 
-  regs_.fill(0);
-  regs_[1] = 0;  // base address
-  regs_[2] = 4;  // loop count
-  regs_[3] = 1;  // increment
+    regs_.fill(0);
+    regs_[1] = 0; // base address
+    regs_[2] = 4; // loop count
+    regs_[3] = 1; // increment
+    regs_[0] = 0; // hardwired zero
 
-  IF_ = PipeReg{};
-  ID_ = PipeReg{};
-  EX_ = PipeReg{};
-  MEM_ = PipeReg{};
-  WB_ = PipeReg{};
-  
-  // Reset stats
-  execStats_ = UI::ExecutionStats{};
+    IF_ = PipeReg{};
+    ID_ = PipeReg{};
+    EX_ = PipeReg{};
+    MEM_ = PipeReg{};
+    WB_ = PipeReg{};
+
+    execStats_ = UI::ExecutionStats{};
+    lastEvent_ = "Reset complete";
 }
 
 std::string Simulator::loadProgram(const std::string& filename) {
     program_ = Parser::parseFile(filename);
     pc_ = 0;
     halted_ = false;
+    squash_ = false;
+    branchTarget_ = 0;
+    memStall_ = false;
 
     IF_ = PipeReg{};
     ID_ = PipeReg{};
@@ -46,11 +53,15 @@ std::string Simulator::loadProgram(const std::string& filename) {
     WB_ = PipeReg{};
 
     regs_.fill(0);
-    regs_[1] = 0;
-    regs_[2] = 4;
-    regs_[3] = 1;
+    regs_[1] = 0; // base address
+    regs_[2] = 4; // loop count
+    regs_[3] = 1; // increment
+    regs_[0] = 0;
 
+    // For the demo, initialize the first 4 memory words to 0.
+    // Do it directly through Memory (not Cache) so cache stats/state stay clean.
     initializeMemoryData();
+    cache_.reset();
 
     std::ostringstream oss;
     oss << "Loaded " << program_.size() << " instructions from " << filename;
@@ -58,9 +69,19 @@ std::string Simulator::loadProgram(const std::string& filename) {
 }
 
 void Simulator::initializeMemoryData() {
-    // Pre-load test data [1, 2, 3, 4]
-    for (int i = 0; i < 4; i++) {
-        cache_.write(i, i + 1, Stage::MEM_STAGE);
+    // Initialize word-addressed memory locations 0..3 to zero.
+    // Memory::writeWord uses the same wait/done timing model as Demo 1,
+    // so retry until each write completes.
+    for (int addr = 0; addr < 4; ++addr) {
+        while (true) {
+            auto res = memory_.writeWord(static_cast<Address>(addr), 0, Stage::MEM_STAGE);
+            if (res.status == AccessStatus::DONE) {
+                break;
+            }
+            if (res.status == AccessStatus::ERROR) {
+                break;
+            }
+        }
     }
 }
 
@@ -92,11 +113,12 @@ bool Simulator::hasRawHazard(const Instruction& inst) const {
     auto dependsOn = [&](int dest) -> bool {
         if (dest <= 0) return false;
 
-        // Which registers does this instruction read?
-        bool reads_rs1 = (inst.op == OP_ADD || inst.op == OP_ADDI ||
-                          inst.op == OP_LOAD || inst.op == OP_STORE ||
-                          inst.op == OP_BNEZ);
-        bool reads_rs2 = (inst.op == OP_ADD || inst.op == OP_STORE);
+        bool reads_rs1 =
+            (inst.op == OP_ADD || inst.op == OP_ADDI || inst.op == OP_LOAD ||
+             inst.op == OP_STORE || inst.op == OP_BNEZ);
+
+        bool reads_rs2 =
+            (inst.op == OP_ADD || inst.op == OP_STORE);
 
         return (reads_rs1 && inst.rs1 == dest) ||
                (reads_rs2 && inst.rs2 == dest);
@@ -125,36 +147,53 @@ void Simulator::commitWB() {
 }
 
 void Simulator::processMEM(bool& stall) {
-  stall = false;
-  if (!MEM_.valid) return;
+    stall = false;
+    if (!MEM_.valid) return;
 
-  const Instruction& inst = MEM_.inst;
+    const Instruction& inst = MEM_.inst;
 
-  if (inst.op == OP_LOAD) {
-      auto res = cache_.read(static_cast<Address>(MEM_.memAddr), Stage::MEM_STAGE);
+    if (inst.op == OP_LOAD) {
+        auto res = cache_.read(static_cast<Address>(MEM_.memAddr), Stage::MEM_STAGE);
 
-      // WORKAROUND: Just immediately return DONE with dummy data
-      // (Skip the WAIT status to avoid infinite stalls)
-      if (res.status == AccessStatus::WAIT) {
-          // Pretend it's done after 1 cycle
-          MEM_.memData = 1; // or read from cache/memory
-          return;  // Return without setting stall=true
-      }
+        if (res.status == AccessStatus::WAIT) {
+            // KEY FIX: Actually stall instead of pretending it finished
+            stall = true;
+            lastEvent_ = "STALL: memory on LOAD";
+            return;
+        }
 
-      if (res.status == AccessStatus::DONE) {
-          uint32_t off = (MEM_.memAddr % RAM_WORDS) % WORDS_PER_LINE;
-          MEM_.memData = res.line.words[off];
-      }
-  } else if (inst.op == OP_STORE) {
-      auto res = cache_.write(static_cast<Address>(MEM_.memAddr),
-                              static_cast<Word>(MEM_.memData),
-                              Stage::MEM_STAGE);
+        if (res.status == AccessStatus::DONE) {
+            uint32_t off = (MEM_.memAddr % RAM_WORDS) % WORDS_PER_LINE;
+            // Access the word from the line - adjust based on your LineData structure
+            MEM_.memData = static_cast<int>(res.line.words[off]);
+            return;
+        }
 
-      // Similar workaround for STORE
-      if (res.status == AccessStatus::WAIT) {
-          return;  // Don't stall, just pretend write happened
-      }
-  }
+        lastEvent_ = "ERROR: LOAD failed in MEM";
+        stall = true;
+        return;
+    }
+
+    if (inst.op == OP_STORE) {
+        auto res = cache_.write(static_cast<Address>(MEM_.memAddr),
+                                static_cast<Word>(MEM_.memData),
+                                Stage::MEM_STAGE);
+
+        if (res.status == AccessStatus::WAIT) {
+            // KEY FIX: Actually stall instead of pretending it finished
+            stall = true;
+            lastEvent_ = "STALL: memory on STORE";
+            return;
+        }
+
+        if (res.status == AccessStatus::DONE) {
+            return;
+        }
+
+        lastEvent_ = "ERROR: STORE failed in MEM";
+        stall = true;
+        return;
+    }
 }
 
 void Simulator::processEX(bool& squash, size_t& newPC) {
@@ -173,7 +212,8 @@ void Simulator::processEX(bool& squash, size_t& newPC) {
         EX_.memAddr = readReg(inst.rs1) + inst.imm;
     } else if (inst.op == OP_STORE) {
         EX_.memAddr = readReg(inst.rs1) + inst.imm;
-        EX_.memData = readReg(inst.rs2);
+        // In this codebase STORE uses rd as the value register.
+        EX_.memData = readReg(inst.rd);
     } else if (inst.op == OP_BNEZ) {
         if (readReg(inst.rs1) != 0) {
             squash = true;
@@ -201,7 +241,7 @@ void Simulator::processIF(bool stall) {
     IF_.inst = program_[pc_];
     IF_.valid = true;
     IF_.pc = static_cast<int>(pc_);
-    pc_++;
+    ++pc_;
 }
 
 std::string Simulator::stageToString(const PipeReg& preg, const std::string& name) const {
@@ -236,90 +276,92 @@ std::string Simulator::dumpRegs() const {
 std::string Simulator::dumpMemoryRange(Address start, Address count) const {
     std::ostringstream oss;
     for (Address a = start; a < start + count; ++a) {
-        oss << "Mem[" << a << "] = " << memory_.peekWord(a) << "\n";
+        oss << "Mem[" << a << "] = " << static_cast<int>(memory_.peekWord(a)) << "\n";
     }
     return oss.str();
 }
 
 std::string Simulator::step() {
-  cycles_++;
-  lastEvent_ = "Advance";
+    ++cycles_;
+    lastEvent_ = "Advance";
 
-  // 1. commit oldest stage
-  commitWB();
+    // 1. Commit oldest stage first.
+    commitWB();
 
-  // 2. process current MEM and EX and ID
-  bool memStall = false;
-  bool rawStall = false;
-  bool squash = false;
-  size_t newPC = pc_;
+    // 2. Process current stages.
+    bool memStall = false;
+    bool rawStall = false;
+    bool squash = false;
+    size_t newPC = pc_;
 
-  processMEM(memStall);
-  if (!memStall) {
-      processEX(squash, newPC);
-      processID(rawStall);
-  }
+    processMEM(memStall);
 
-  // 3. shift pipeline
-  if (memStall) {
-      // keep MEM on the same instruction so the same request is retried next cycle
-      // do not shift IF/ID/EX/MEM forward
-      WB_ = PipeReg{};
-  } else if (squash) {
-      WB_ = MEM_;
-      MEM_ = EX_;
-      EX_ = PipeReg{};
-      ID_ = PipeReg{};
-      IF_ = PipeReg{};
-      pc_ = newPC;
-  } else if (rawStall) {
-      WB_ = MEM_;
-      MEM_ = EX_;
-      EX_ = PipeReg{}; // bubble
-      // ID and IF stay
-  } else {
-      WB_ = MEM_;
-      MEM_ = EX_;
-      EX_ = ID_;
-      ID_ = IF_;
-      IF_ = PipeReg{};
-      processIF(false);
-  }
+    if (!memStall) {
+        processEX(squash, newPC);
+        processID(rawStall);
+    }
 
-  // Build output using enhanced UI formatting
-  std::ostringstream oss;
-  oss << UI::formatCycleHeader(cycles_, lastEvent_);
-  oss << UI::formatPipeline(
-      IF_.valid ? IF_.inst.toString() : "-",
-      ID_.valid ? ID_.inst.toString() : "-",
-      EX_.valid ? EX_.inst.toString() : "-",
-      MEM_.valid ? MEM_.inst.toString() : "-",
-      WB_.valid ? WB_.inst.toString() : "-"
-  );
-  oss << UI::formatStatusBar(memory_.busy(), memory_.remainingCycles(), pc_);
-  oss << "╚════════════════════════════════════════════════════════════════╝\n";
-  
-  return UI::prettyPrint(oss.str());
+    // 3. Shift / freeze pipeline.
+    if (memStall) {
+        // Keep MEM on the same instruction so the same request is retried next cycle.
+        // Freeze IF/ID/EX/MEM. WB already committed this cycle.
+        WB_ = PipeReg{};
+    } else if (squash) {
+        WB_ = MEM_;
+        MEM_ = EX_;
+        EX_ = PipeReg{};
+        ID_ = PipeReg{};
+        IF_ = PipeReg{};
+        pc_ = newPC;
+    } else if (rawStall) {
+        WB_ = MEM_;
+        MEM_ = EX_;
+        EX_ = PipeReg{}; // bubble
+        // ID and IF stay in place
+    } else {
+        WB_ = MEM_;
+        MEM_ = EX_;
+        EX_ = ID_;
+        ID_ = IF_;
+        IF_ = PipeReg{};
+        processIF(false);
+    }
+
+    std::ostringstream oss;
+    oss << UI::formatCycleHeader(cycles_, lastEvent_);
+    oss << UI::formatPipeline(
+        IF_.valid ? IF_.inst.toString() : "-",
+        ID_.valid ? ID_.inst.toString() : "-",
+        EX_.valid ? EX_.inst.toString() : "-",
+        MEM_.valid ? MEM_.inst.toString() : "-",
+        WB_.valid ? WB_.inst.toString() : "-"
+    );
+    oss << UI::formatStatusBar(memory_.busy(), memory_.remainingCycles(), pc_);
+    oss << "╚════════════════════════════════════════════════════════════════╝\n";
+    return UI::prettyPrint(oss.str());
 }
 
 std::string Simulator::run() {
-  if (program_.empty()) {
-      return "No Program Loaded.";
-  }
-  
-  std::ostringstream oss;
-  oss << UI::formatProgramStart();
+    if (program_.empty()) {
+        return "No Program Loaded.";
+    }
 
-  while (!halted_ || IF_.valid || ID_.valid || EX_.valid || MEM_.valid || WB_.valid || pc_ < program_.size()) {
-      oss << step() << "\n";
-      if (halted_ && !IF_.valid && !ID_.valid && !EX_.valid && !MEM_.valid && !WB_.valid && pc_ >= program_.size()) {
-          break;
-      }
-  }
+    std::ostringstream oss;
+    oss << UI::formatProgramStart();
 
-  oss << UI::formatCompletionBanner(cycles_, dumpRegs());
-  oss << UI::formatProgramEnd();
-  return oss.str();
+    while (!halted_ || IF_.valid || ID_.valid || EX_.valid || MEM_.valid || WB_.valid ||
+           pc_ < program_.size()) {
+        oss << step() << "\n";
+
+        if (halted_ && !IF_.valid && !ID_.valid && !EX_.valid && !MEM_.valid && !WB_.valid &&
+            pc_ >= program_.size()) {
+            break;
+        }
+    }
+
+    oss << UI::formatCompletionBanner(cycles_, dumpRegs());
+    oss << UI::formatProgramEnd();
+    return oss.str();
 }
 
 // ----------------------
@@ -331,7 +373,7 @@ std::string Simulator::handleRead(Address address, Stage stage) {
         return "ERROR: stage must be IF or MEM";
     }
 
-    cycles_++;
+    ++cycles_;
     auto res = cache_.read(address, stage);
 
     std::ostringstream oss;
@@ -342,8 +384,7 @@ std::string Simulator::handleRead(Address address, Stage stage) {
         oss << "wait";
     } else if (res.status == AccessStatus::DONE) {
         uint32_t off = (address % RAM_WORDS) % WORDS_PER_LINE;
-        oss << "done, line=" << lineToHexString(res.line)
-            << ", requested_word=" << wordToHex(res.line.words[off]);
+        oss << "done, word=" << res.line.words[off];
     } else {
         oss << "error";
     }
@@ -357,12 +398,12 @@ std::string Simulator::handleWrite(Word value, Address address, Stage stage) {
         return "ERROR: stage must be IF or MEM";
     }
 
-    cycles_++;
+    ++cycles_;
     auto res = cache_.write(address, value, stage);
 
     std::ostringstream oss;
     oss << "[cycle " << cycles_ << "] "
-        << "W " << wordToHex(value) << " " << address << " " << ::stageToString(stage) << " -> ";
+        << "W " << value << " " << address << " " << ::stageToString(stage) << " -> ";
 
     if (res.status == AccessStatus::WAIT) {
         oss << "wait";
@@ -382,21 +423,17 @@ std::string Simulator::handleView(int level, uint32_t line) const {
     if (level == 0) {
         auto ramLine = memory_.viewLine(line);
         oss << "V 0 " << line << " -> RAM line " << line
-            << " = " << lineToHexString(ramLine);
+            << " (words in line available via memory interface)";
         return oss.str();
     }
 
     if (level == 1) {
         const auto& c = cache_.viewLine(line);
-
-        LineData cacheLineData;
-        cacheLineData.words = c.data;
-
-        oss << "V 1 " << line << " -> CACHE line " << (line % CACHE_LINES)
-            << " | tag=" << wordToHex(static_cast<Word>(c.tag))
+        oss << "V 1 " << line
+            << " -> CACHE line " << (line % CACHE_LINES)
+            << " | tag=" << c.tag
             << " valid=" << (c.valid ? 1 : 0)
-            << " dirty=" << (c.dirty ? 1 : 0)
-            << " data=" << lineToHexString(cacheLineData);
+            << " dirty=" << (c.dirty ? 1 : 0);
         return oss.str();
     }
 
@@ -404,18 +441,19 @@ std::string Simulator::handleView(int level, uint32_t line) const {
 }
 
 std::string Simulator::handleHelp() const {
-    return "Commands:\n"
-           "  R <address> <stage>         e.g. R 12 IF\n"
-           "  W <value> <address> <stage> e.g. W 99 12 MEM\n"
-           "  V <level> <line>            level 0=RAM, 1=cache\n"
-           "  S                           show status\n"
-           "  LOADPROG <file>             load program file\n"
-           "  STEP                        execute one clock cycle\n"
-           "  RUN                         run to completion\n"
-           "  REGS                        show registers\n"
-           "  MEMRANGE <start> <count>    show memory range\n"
-           "  H                           help\n"
-           "  Q                           quit";
+    return
+        "Commands:\n"
+        "  R <address> <stage>         e.g. R 12 IF\n"
+        "  W <value> <address> <stage> e.g. W 99 12 MEM\n"
+        "  V <level> <line>            level 0=RAM, 1=cache\n"
+        "  S                           show status\n"
+        "  LOADPROG <file>             load program file\n"
+        "  STEP                        execute one clock cycle\n"
+        "  RUN                         run to completion\n"
+        "  REGS                        show registers\n"
+        "  MEMRANGE <start> <count>    show memory range\n"
+        "  H                           help\n"
+        "  Q                           quit";
 }
 
 std::string Simulator::handleStatus() const {
@@ -429,6 +467,7 @@ std::string Simulator::handleStatus() const {
         << "  cache_misses=" << cache_.misses() << "\n"
         << "  cache_reads=" << cache_.reads() << "\n"
         << "  cache_writes=" << cache_.writes() << "\n"
+        << "  last_event=" << lastEvent_ << "\n"
         << dumpPipeline();
     return oss.str();
 }
