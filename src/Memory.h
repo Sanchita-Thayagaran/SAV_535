@@ -1,29 +1,19 @@
 #pragma once
 #include "Types.h"
-#include <vector>
+#include <array>
 
-class Memory
-{
+class Memory {
 public:
-  Memory();
+    Memory();
 
-  void reset();
+    void reset();
 
-  MemoryResponse readLine(Address address, Stage stage);
-  WriteResponse writeWord(Address address, Word value, Stage stage);
+    Word peekWord(Address address) const;
+    void pokeWord(Address address, Word value);
 
-  LineData viewLine(uint32_t lineNumber) const;
-  Word peekWord(Address address) const;
-
-  bool busy() const;
-  Stage activeStage() const;
-  int remainingCycles() const;
+    LineData peekLine(Address address) const;
+    void pokeLine(Address address, const LineData& line);
 
 private:
-  Address normalize(Address addr) const;
-  uint32_t lineNumberFromAddress(Address addr) const;
-  uint32_t numLines() const;
-
-  std::vector<Word> ram_;
-  PendingMemoryRequest pending_;
+    std::array<Word, RAM_WORDS> ram_{};
 };
