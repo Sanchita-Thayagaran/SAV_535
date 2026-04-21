@@ -1,0 +1,8 @@
+main:
+    ADDI R1, R0, 5
+    ADDI R2, R0, 0
+loop:
+    ADD  R2, R2, R1
+    ADDI R1, R1, -1
+    BNEZ R1, loop
+    HALT

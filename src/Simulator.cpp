@@ -1,473 +1,594 @@
 #include "Simulator.h"
-#include "Parser.h"
 #include "UI.h"
-
-#include <iomanip>
-#include <iostream>
+#include <climits>
 #include <sstream>
+#include <stdexcept>
 
-Simulator::Simulator() : memory_(), cache_(memory_) {
+namespace {
+int32_t add32(int32_t a, int32_t b) {
+    return static_cast<int32_t>(static_cast<uint32_t>(a) + static_cast<uint32_t>(b));
+}
+int32_t sub32(int32_t a, int32_t b) {
+    return static_cast<int32_t>(static_cast<uint32_t>(a) - static_cast<uint32_t>(b));
+}
+int32_t mul32(int32_t a, int32_t b) {
+    int64_t wide = static_cast<int64_t>(a) * static_cast<int64_t>(b);
+    return static_cast<int32_t>(static_cast<uint32_t>(wide));
+}
+int32_t div32(int32_t a, int32_t b) {
+    if (b == 0) return 0;
+    if (a == INT32_MIN && b == -1) return INT32_MIN;
+    return a / b;
+}
+int32_t mod32(int32_t a, int32_t b) {
+    if (b == 0) return 0;
+    if (a == INT32_MIN && b == -1) return 0;
+    return a % b;
+}
+int32_t sll32(int32_t a, int32_t sh) {
+    return static_cast<int32_t>(static_cast<uint32_t>(a) << (sh & 0x1F));
+}
+int32_t srl32(int32_t a, int32_t sh) {
+    return static_cast<int32_t>(static_cast<uint32_t>(a) >> (sh & 0x1F));
+}
+int32_t sra32(int32_t a, int32_t sh) {
+    return static_cast<int32_t>(a >> (sh & 0x1F));
+}
+}
+
+Simulator::Simulator() : l2_(memory_), l1_(l2_) {
     reset();
 }
 
 void Simulator::reset() {
     memory_.reset();
-    cache_.reset();
-
+    l2_.reset();
+    l1_.reset();
+    regs_.fill(0);
+    status_ = {};
     cycles_ = 0;
     pc_ = 0;
     halted_ = false;
-    squash_ = false;
-    branchTarget_ = 0;
-    memStall_ = false;
-    memAccessType_ = AccessType::READ_LINE;
-
-    regs_.fill(0);
-    regs_[1] = 0; // base address
-    regs_[2] = 4; // loop count
-    regs_[3] = 1; // increment
-    regs_[0] = 0; // hardwired zero
-
-    IF_ = PipeReg{};
-    ID_ = PipeReg{};
-    EX_ = PipeReg{};
-    MEM_ = PipeReg{};
-    WB_ = PipeReg{};
-
-    execStats_ = UI::ExecutionStats{};
-    lastEvent_ = "Reset complete";
+    programBase_ = 0;
+    programSize_ = 0;
+    IF_ = {};
+    ID_ = {};
+    EX_ = {};
+    MEM_ = {};
+    WB_ = {};
+    hierarchyPort_ = {};
+    seq_ = {};
 }
 
-std::string Simulator::loadProgram(const std::string& filename) {
-    program_ = Parser::parseFile(filename);
-    pc_ = 0;
-    halted_ = false;
-    squash_ = false;
-    branchTarget_ = 0;
-    memStall_ = false;
-
-    IF_ = PipeReg{};
-    ID_ = PipeReg{};
-    EX_ = PipeReg{};
-    MEM_ = PipeReg{};
-    WB_ = PipeReg{};
-
-    regs_.fill(0);
-    regs_[1] = 0; // base address
-    regs_[2] = 4; // loop count
-    regs_[3] = 1; // increment
-    regs_[0] = 0;
-
-    // For the demo, initialize the first 4 memory words to 0.
-    // Do it directly through Memory (not Cache) so cache stats/state stay clean.
-    initializeMemoryData();
-    cache_.reset();
-
-    std::ostringstream oss;
-    oss << "Loaded " << program_.size() << " instructions from " << filename;
-    return oss.str();
-}
-
-void Simulator::initializeMemoryData() {
-    // Initialize word-addressed memory locations 0..3 to zero.
-    // Memory::writeWord uses the same wait/done timing model as Demo 1,
-    // so retry until each write completes.
-    for (int addr = 0; addr < 4; ++addr) {
-        while (true) {
-            auto res = memory_.writeWord(static_cast<Address>(addr), 0, Stage::MEM_STAGE);
-            if (res.status == AccessStatus::DONE) {
-                break;
-            }
-            if (res.status == AccessStatus::ERROR) {
-                break;
-            }
-        }
+std::string Simulator::loadProgramWords(const std::vector<uint32_t>& words) {
+    reset();
+    programBase_ = 0;
+    programSize_ = static_cast<uint32_t>(words.size());
+    for (uint32_t i = 0; i < words.size(); ++i) {
+        memory_.pokeWord(programBase_ + i, words[i]);
     }
+    pc_ = programBase_;
+    seq_.pc = programBase_;
+    return "Program loaded";
 }
 
-bool Simulator::writesRegister(const Instruction& inst) const {
-    return inst.op == OP_ADD || inst.op == OP_ADDI || inst.op == OP_LOAD;
+std::string Simulator::loadProgramAsm(const std::string& filename) {
+    auto assembled = Assembler::assembleFile(filename);
+    return loadProgramWords(assembled.words);
 }
 
-bool Simulator::isLoad(const Instruction& inst) const {
-    return inst.op == OP_LOAD;
+void Simulator::setMode(ExecMode mode) {
+    mode_ = mode;
 }
 
-bool Simulator::isStore(const Instruction& inst) const {
-    return inst.op == OP_STORE;
+std::string Simulator::modeString() const {
+    switch (mode_) {
+        case ExecMode::NO_PIPE_NO_CACHE: return "NO_PIPE_NO_CACHE";
+        case ExecMode::NO_PIPE_CACHE:    return "NO_PIPE_CACHE";
+        case ExecMode::PIPE_NO_CACHE:    return "PIPE_NO_CACHE";
+        case ExecMode::PIPE_CACHE:       return "PIPE_CACHE";
+    }
+    return "UNKNOWN";
 }
 
-bool Simulator::isBranch(const Instruction& inst) const {
-    return inst.op == OP_BNEZ;
-}
-
-int Simulator::readReg(int reg) const {
-    if (reg < 0 || reg >= 16) return 0;
-    if (reg == 0) return 0;
+int32_t Simulator::readReg(int reg) const {
+    if (reg <= 0 || reg > 15) return 0;
     return regs_[reg];
 }
 
-bool Simulator::hasRawHazard(const Instruction& inst) const {
-    if (!ID_.valid) return false;
+void Simulator::writeReg(int reg, int32_t value) {
+    if (reg == 0) return;
+    if (reg >= 0 && reg < 16) regs_[reg] = value;
+}
 
-    auto dependsOn = [&](int dest) -> bool {
-        if (dest <= 0) return false;
+void Simulator::updateZeroFlagIfNeeded(const Instruction& inst, int32_t value) {
+    if (inst.updatesZeroFlag()) status_.Z = (value == 0);
+}
 
-        bool reads_rs1 =
-            (inst.op == OP_ADD || inst.op == OP_ADDI || inst.op == OP_LOAD ||
-             inst.op == OP_STORE || inst.op == OP_BNEZ);
+int32_t Simulator::evalALU(const Instruction& inst, int32_t a, int32_t b) const {
+    switch (inst.op) {
+        case Opcode::ADD:  return add32(a, b);
+        case Opcode::SUB:  return sub32(a, b);
+        case Opcode::MUL:  return mul32(a, b);
+        case Opcode::DIV:  return div32(a, b);
+        case Opcode::MOD:  return mod32(a, b);
+        case Opcode::AND:  return static_cast<int32_t>(static_cast<uint32_t>(a) & static_cast<uint32_t>(b));
+        case Opcode::OR:   return static_cast<int32_t>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
+        case Opcode::XOR:  return static_cast<int32_t>(static_cast<uint32_t>(a) ^ static_cast<uint32_t>(b));
+        case Opcode::NOT:  return static_cast<int32_t>(~static_cast<uint32_t>(a));
+        case Opcode::SLL:  return sll32(a, b);
+        case Opcode::SRL:  return srl32(a, b);
+        case Opcode::SRA:  return sra32(a, b);
+        case Opcode::SLT:  return (a < b) ? 1 : 0;
+        case Opcode::ADDI: return add32(a, inst.imm);
+        default:           return 0;
+    }
+}
 
-        bool reads_rs2 =
-            (inst.op == OP_ADD || inst.op == OP_STORE);
+bool Simulator::evalBranch(const Instruction& inst, int32_t a, int32_t b) const {
+    switch (inst.op) {
+        case Opcode::BEQ: return a == b;
+        case Opcode::BNE: return a != b;
+        case Opcode::BLT: return a < b;
+        case Opcode::BGE: return a >= b;
+        default: return false;
+    }
+}
 
-        return (reads_rs1 && inst.rs1 == dest) ||
-               (reads_rs2 && inst.rs2 == dest);
+HierarchyResult Simulator::accessReadWord(Address address, bool cachesEnabled) {
+    if (cachesEnabled) return l1_.readWord(address);
+    HierarchyResult out;
+    out.hit = false;
+    out.l2Hit = false;
+    out.word = memory_.peekWord(address);
+    out.latency = DRAM_LATENCY;
+    out.message = "Memory read";
+    return out;
+}
+
+HierarchyResult Simulator::accessWriteWord(Address address, Word value, bool cachesEnabled) {
+    if (cachesEnabled) return l1_.writeWord(address, value);
+    memory_.pokeWord(address, value);
+    HierarchyResult out;
+    out.word = value;
+    out.latency = DRAM_LATENCY;
+    out.message = "Memory write";
+    return out;
+}
+
+bool Simulator::startHierarchyRequest(Stage owner, HierarchyPort::Kind kind, Address address,
+                                      bool cachesEnabled, Word writeValue, int destReg, uint32_t producerPc) {
+    if (hierarchyPort_.busy) return false;
+    hierarchyPort_.busy = true;
+    hierarchyPort_.owner = owner;
+    hierarchyPort_.kind = kind;
+    hierarchyPort_.address = address;
+    hierarchyPort_.writeValue = writeValue;
+    hierarchyPort_.destReg = destReg;
+    hierarchyPort_.producerPc = producerPc;
+    hierarchyPort_.result = (kind == HierarchyPort::Kind::STORE || kind == HierarchyPort::Kind::SEQ_STORE)
+        ? accessWriteWord(address, writeValue, cachesEnabled)
+        : accessReadWord(address, cachesEnabled);
+    hierarchyPort_.remaining = hierarchyPort_.result.latency;
+    return true;
+}
+
+void Simulator::advanceHierarchy() {
+    if (!hierarchyPort_.busy) return;
+    if (hierarchyPort_.remaining > 0) --hierarchyPort_.remaining;
+    if (hierarchyPort_.remaining != 0) return;
+
+    switch (hierarchyPort_.kind) {
+        case HierarchyPort::Kind::FETCH:
+            IF_.valid = true;
+            IF_.pc = hierarchyPort_.producerPc;
+            IF_.raw = hierarchyPort_.result.word;
+            IF_.inst = decodeInstruction(hierarchyPort_.result.word);
+            break;
+        case HierarchyPort::Kind::LOAD:
+            MEM_.wbValue = static_cast<int32_t>(hierarchyPort_.result.word);
+            break;
+        case HierarchyPort::Kind::STORE:
+            break;
+        case HierarchyPort::Kind::SEQ_FETCH:
+            seq_.raw = hierarchyPort_.result.word;
+            seq_.inst = decodeInstruction(seq_.raw);
+            seq_.phase = SeqState::Phase::EXECUTE;
+            break;
+        case HierarchyPort::Kind::SEQ_LOAD:
+            seq_.wbValue = static_cast<int32_t>(hierarchyPort_.result.word);
+            seq_.phase = SeqState::Phase::WRITEBACK;
+            break;
+        case HierarchyPort::Kind::SEQ_STORE:
+            seq_.phase = SeqState::Phase::WRITEBACK;
+            break;
+        case HierarchyPort::Kind::NONE:
+            break;
+    }
+    hierarchyPort_ = {};
+}
+
+bool Simulator::pendingDestInPipe(int reg) const {
+    if (reg == 0) return false;
+    auto matches = [&](const PipeReg& p) {
+        return p.valid && p.inst.writesRegister() && p.inst.rd == reg;
     };
+    return matches(EX_) || matches(MEM_);
+}
 
-    if (EX_.valid && writesRegister(EX_.inst) && dependsOn(EX_.inst.rd)) return true;
-    if (MEM_.valid && writesRegister(MEM_.inst) && dependsOn(MEM_.inst.rd)) return true;
-
+bool Simulator::hasRawHazard(const Instruction& inst) const {
+    if (inst.readsRs1() && pendingDestInPipe(inst.rs1)) return true;
+    if (inst.readsRs2() && pendingDestInPipe(inst.rs2)) return true;
+    if (inst.isStore() && pendingDestInPipe(inst.rd)) return true;
+    if (inst.isJump() && pendingDestInPipe(inst.rs1)) return true;
     return false;
 }
 
-void Simulator::commitWB() {
-    if (!WB_.valid) return;
-
-    const Instruction& inst = WB_.inst;
-
-    if (inst.op == OP_ADD || inst.op == OP_ADDI) {
-        if (inst.rd != 0) regs_[inst.rd] = WB_.exResult;
-    } else if (inst.op == OP_LOAD) {
-        if (inst.rd != 0) regs_[inst.rd] = WB_.memData;
-    } else if (inst.op == OP_HALT) {
-        halted_ = true;
-    }
-
-    regs_[0] = 0;
+uint32_t Simulator::fetchInstructionWord(uint32_t address, bool cachesEnabled, bool& stall, std::string& msg) {
+    auto res = accessReadWord(address, cachesEnabled);
+    stall = false;
+    msg = res.message;
+    return res.word;
 }
 
-void Simulator::processMEM(bool& stall) {
+Instruction Simulator::fetchAndDecode(uint32_t address, bool cachesEnabled, bool& stall, std::string& msg) {
+    return decodeInstruction(fetchInstructionWord(address, cachesEnabled, stall, msg));
+}
+
+void Simulator::doWB() {
+    if (!WB_.valid) return;
+    if (WB_.inst.writesRegister()) {
+        writeReg(WB_.inst.op == Opcode::JAL ? 15 : WB_.inst.rd, WB_.wbValue);
+        updateZeroFlagIfNeeded(WB_.inst, WB_.wbValue);
+    }
+    if (WB_.inst.op == Opcode::HALT) {
+        halted_ = true;
+    }
+    WB_ = {};
+}
+
+void Simulator::doMEM(bool cachesEnabled, bool& stall) {
     stall = false;
     if (!MEM_.valid) return;
 
-    const Instruction& inst = MEM_.inst;
-
-    if (inst.op == OP_LOAD) {
-        auto res = cache_.read(static_cast<Address>(MEM_.memAddr), Stage::MEM_STAGE);
-
-        if (res.status == AccessStatus::WAIT) {
-            // KEY FIX: Actually stall instead of pretending it finished
+    if (MEM_.inst.isLoad()) {
+        if (MEM_.wbValue == 0 && !hierarchyPort_.busy) {
+            if (!startHierarchyRequest(Stage::MEM_STAGE, HierarchyPort::Kind::LOAD,
+                                       static_cast<Address>(MEM_.memAddr), cachesEnabled,
+                                       0, MEM_.inst.rd, MEM_.pc)) {
+                stall = true;
+                return;
+            }
+        }
+        if (hierarchyPort_.busy && hierarchyPort_.owner == Stage::MEM_STAGE) {
             stall = true;
-            lastEvent_ = "STALL: memory on LOAD";
             return;
         }
-
-        if (res.status == AccessStatus::DONE) {
-            uint32_t off = (MEM_.memAddr % RAM_WORDS) % WORDS_PER_LINE;
-            // Access the word from the line - adjust based on your LineData structure
-            MEM_.memData = static_cast<int>(res.line.words[off]);
-            return;
-        }
-
-        lastEvent_ = "ERROR: LOAD failed in MEM";
-        stall = true;
+        WB_ = MEM_;
+        MEM_ = {};
         return;
     }
 
-    if (inst.op == OP_STORE) {
-        auto res = cache_.write(static_cast<Address>(MEM_.memAddr),
-                                static_cast<Word>(MEM_.memData),
-                                Stage::MEM_STAGE);
-
-        if (res.status == AccessStatus::WAIT) {
-            // KEY FIX: Actually stall instead of pretending it finished
+    if (MEM_.inst.isStore()) {
+        if (!hierarchyPort_.busy) {
+            if (!startHierarchyRequest(Stage::MEM_STAGE, HierarchyPort::Kind::STORE,
+                                       static_cast<Address>(MEM_.memAddr), cachesEnabled,
+                                       static_cast<Word>(MEM_.memData), 0, MEM_.pc)) {
+                stall = true;
+                return;
+            }
+        }
+        if (hierarchyPort_.busy && hierarchyPort_.owner == Stage::MEM_STAGE) {
             stall = true;
-            lastEvent_ = "STALL: memory on STORE";
             return;
         }
-
-        if (res.status == AccessStatus::DONE) {
-            return;
-        }
-
-        lastEvent_ = "ERROR: STORE failed in MEM";
-        stall = true;
+        WB_ = {};
+        MEM_ = {};
         return;
     }
+
+    WB_ = MEM_;
+    MEM_ = {};
 }
 
-void Simulator::processEX(bool& squash, size_t& newPC) {
+void Simulator::doEX(bool& squash, uint32_t& newPC) {
     squash = false;
     newPC = pc_;
-
     if (!EX_.valid) return;
 
-    Instruction& inst = EX_.inst;
+    auto& inst = EX_.inst;
+    const int32_t a = EX_.opA;
+    const int32_t b = EX_.opB;
 
-    if (inst.op == OP_ADD) {
-        EX_.exResult = readReg(inst.rs1) + readReg(inst.rs2);
-    } else if (inst.op == OP_ADDI) {
-        EX_.exResult = readReg(inst.rs1) + inst.imm;
-    } else if (inst.op == OP_LOAD) {
-        EX_.memAddr = readReg(inst.rs1) + inst.imm;
-    } else if (inst.op == OP_STORE) {
-        EX_.memAddr = readReg(inst.rs1) + inst.imm;
-        // In this codebase STORE uses rd as the value register.
-        EX_.memData = readReg(inst.rd);
-    } else if (inst.op == OP_BNEZ) {
-        if (readReg(inst.rs1) != 0) {
-            squash = true;
-            newPC = static_cast<size_t>(EX_.pc + 1 + inst.imm);
-            lastEvent_ = "SQUASH: taken branch";
-        }
+    if (inst.op == Opcode::HALT) {
+        MEM_ = EX_;
+        EX_ = {};
+        return;
     }
+
+    if (inst.isBranch()) {
+        if (evalBranch(inst, a, b)) {
+            squash = true;
+            newPC = EX_.pc + 1 + static_cast<uint32_t>(inst.imm);
+        }
+        MEM_ = {};
+        EX_ = {};
+        return;
+    }
+
+    if (inst.op == Opcode::J) {
+        squash = true;
+        newPC = static_cast<uint32_t>(a);
+        MEM_ = {};
+        EX_ = {};
+        return;
+    }
+
+    if (inst.op == Opcode::JAL) {
+        EX_.wbValue = static_cast<int32_t>(EX_.pc + 1);
+        squash = true;
+        newPC = static_cast<uint32_t>(a);
+        MEM_ = EX_;
+        EX_ = {};
+        return;
+    }
+
+    if (inst.isLoad() || inst.isStore()) {
+        EX_.memAddr = add32(a, inst.imm);
+        if (inst.isStore()) EX_.memData = readReg(inst.rd);
+        MEM_ = EX_;
+        EX_ = {};
+        return;
+    }
+
+    EX_.wbValue = evalALU(inst, a, b);
+    MEM_ = EX_;
+    EX_ = {};
 }
 
-void Simulator::processID(bool& stall) {
+void Simulator::doID(bool& stall) {
     stall = false;
     if (!ID_.valid) return;
-
-    stall = hasRawHazard(ID_.inst);
-    if (stall) {
-        lastEvent_ = "STALL: RAW hazard";
+    if (hasRawHazard(ID_.inst)) {
+        stall = true;
+        return;
     }
+
+    ID_.opA = readReg(ID_.inst.rs1);
+    ID_.opB = readReg(ID_.inst.rs2);
+    EX_ = ID_;
+    ID_ = {};
 }
 
-void Simulator::processIF(bool stall) {
-    if (stall || halted_) return;
-    if (pc_ >= program_.size()) return;
-    if (IF_.valid) return;
-
-    IF_.inst = program_[pc_];
-    IF_.valid = true;
-    IF_.pc = static_cast<int>(pc_);
-    ++pc_;
+void Simulator::doIF(bool cachesEnabled, bool stall) {
+    if (stall || halted_ || IF_.valid || hierarchyPort_.busy) return;
+    startHierarchyRequest(Stage::IF_STAGE, HierarchyPort::Kind::FETCH, pc_, cachesEnabled, 0, 0, pc_);
+    if (!hierarchyPort_.busy) return;
 }
 
-std::string Simulator::stageToString(const PipeReg& preg, const std::string& name) const {
-    std::ostringstream oss;
-    oss << name << ": ";
-    if (!preg.valid) oss << "-";
-    else oss << preg.inst.toString();
-    return oss.str();
-}
+void Simulator::stepPipelineCycle(bool cachesEnabled) {
+    advanceHierarchy();
 
-std::string Simulator::dumpPipeline() const {
-    std::ostringstream oss;
-    oss << "---------------- PIPELINE ----------------\n";
-    oss << stageToString(IF_, "IF") << "\n";
-    oss << stageToString(ID_, "ID") << "\n";
-    oss << stageToString(EX_, "EX") << "\n";
-    oss << stageToString(MEM_, "MEM") << "\n";
-    oss << stageToString(WB_, "WB") << "\n";
-    oss << "------------------------------------------";
-    return oss.str();
-}
+    doWB();
 
-std::string Simulator::dumpRegs() const {
-    std::ostringstream oss;
-    oss << "Registers:\n";
-    for (int i = 0; i < 16; ++i) {
-        oss << "R" << i << " = " << regs_[i] << "\n";
+    bool memStall = false;
+    doMEM(cachesEnabled, memStall);
+    if (memStall) {
+        ++cycles_;
+        regs_[0] = 0;
+        return;
     }
-    return oss.str();
+
+    bool squash = false;
+    uint32_t newPC = pc_;
+    doEX(squash, newPC);
+
+    bool idStall = false;
+    doID(idStall);
+
+    if (!idStall && ID_.valid == false && IF_.valid) {
+        ID_ = IF_;
+        IF_ = {};
+        if (!squash) ++pc_;
+    }
+
+    if (squash) {
+        IF_ = {};
+        ID_ = {};
+        pc_ = newPC;
+    }
+
+    doIF(cachesEnabled, idStall);
+
+    ++cycles_;
+    regs_[0] = 0;
 }
 
-std::string Simulator::dumpMemoryRange(Address start, Address count) const {
-    std::ostringstream oss;
-    for (Address a = start; a < start + count; ++a) {
-        oss << "Mem[" << a << "] = " << static_cast<int>(memory_.peekWord(a)) << "\n";
+void Simulator::stepSequentialCycle(bool cachesEnabled) {
+    advanceHierarchy();
+
+    switch (seq_.phase) {
+        case SeqState::Phase::IDLE:
+            if (halted_) {
+                seq_.phase = SeqState::Phase::HALTED;
+                break;
+            }
+            seq_.pc = pc_;
+            if (!hierarchyPort_.busy) {
+                startHierarchyRequest(Stage::SEQ_STAGE, HierarchyPort::Kind::SEQ_FETCH, seq_.pc, cachesEnabled);
+                seq_.phase = SeqState::Phase::FETCH_WAIT;
+            }
+            break;
+
+        case SeqState::Phase::FETCH_WAIT:
+            break;
+
+        case SeqState::Phase::EXECUTE: {
+            auto& inst = seq_.inst;
+            if (inst.op == Opcode::HALT) {
+                halted_ = true;
+                seq_.phase = SeqState::Phase::HALTED;
+                break;
+            }
+            const int32_t a = readReg(inst.rs1);
+            const int32_t b = readReg(inst.rs2);
+
+            if (inst.isBranch()) {
+                if (evalBranch(inst, a, b)) pc_ = seq_.pc + 1 + static_cast<uint32_t>(inst.imm);
+                else pc_ = seq_.pc + 1;
+                seq_.phase = SeqState::Phase::IDLE;
+                break;
+            }
+
+            if (inst.op == Opcode::J) {
+                pc_ = static_cast<uint32_t>(a);
+                seq_.phase = SeqState::Phase::IDLE;
+                break;
+            }
+
+            if (inst.op == Opcode::JAL) {
+                writeReg(15, static_cast<int32_t>(seq_.pc + 1));
+                pc_ = static_cast<uint32_t>(a);
+                seq_.phase = SeqState::Phase::IDLE;
+                break;
+            }
+
+            if (inst.isLoad()) {
+                seq_.memAddr = add32(a, inst.imm);
+                if (!hierarchyPort_.busy) {
+                    startHierarchyRequest(Stage::SEQ_STAGE, HierarchyPort::Kind::SEQ_LOAD,
+                                          static_cast<Address>(seq_.memAddr), cachesEnabled, 0, inst.rd, seq_.pc);
+                    seq_.phase = SeqState::Phase::MEM_WAIT;
+                }
+                break;
+            }
+
+            if (inst.isStore()) {
+                seq_.memAddr = add32(a, inst.imm);
+                seq_.memData = readReg(inst.rd);
+                if (!hierarchyPort_.busy) {
+                    startHierarchyRequest(Stage::SEQ_STAGE, HierarchyPort::Kind::SEQ_STORE,
+                                          static_cast<Address>(seq_.memAddr), cachesEnabled,
+                                          static_cast<Word>(seq_.memData), 0, seq_.pc);
+                    seq_.phase = SeqState::Phase::MEM_WAIT;
+                }
+                break;
+            }
+
+            seq_.wbValue = evalALU(inst, a, b);
+            seq_.phase = SeqState::Phase::WRITEBACK;
+            break;
+        }
+
+        case SeqState::Phase::MEM_WAIT:
+            break;
+
+        case SeqState::Phase::WRITEBACK:
+            if (seq_.inst.writesRegister()) {
+                writeReg(seq_.inst.op == Opcode::JAL ? 15 : seq_.inst.rd, seq_.wbValue);
+                updateZeroFlagIfNeeded(seq_.inst, seq_.wbValue);
+            }
+            pc_ = seq_.pc + 1;
+            seq_.phase = SeqState::Phase::IDLE;
+            break;
+
+        case SeqState::Phase::HALTED:
+            break;
     }
-    return oss.str();
+
+    ++cycles_;
+    regs_[0] = 0;
 }
 
 std::string Simulator::step() {
-    ++cycles_;
-    lastEvent_ = "Advance";
-
-    // 1. Commit oldest stage first.
-    commitWB();
-
-    // 2. Process current stages.
-    bool memStall = false;
-    bool rawStall = false;
-    bool squash = false;
-    size_t newPC = pc_;
-
-    processMEM(memStall);
-
-    if (!memStall) {
-        processEX(squash, newPC);
-        processID(rawStall);
+    if (halted_ && mode_ != ExecMode::NO_PIPE_NO_CACHE && mode_ != ExecMode::NO_PIPE_CACHE) return "HALTED";
+    switch (mode_) {
+        case ExecMode::NO_PIPE_NO_CACHE: stepSequentialCycle(false); break;
+        case ExecMode::NO_PIPE_CACHE:    stepSequentialCycle(true); break;
+        case ExecMode::PIPE_NO_CACHE:    stepPipelineCycle(false); break;
+        case ExecMode::PIPE_CACHE:       stepPipelineCycle(true); break;
     }
-
-    // 3. Shift / freeze pipeline.
-    if (memStall) {
-        // Keep MEM on the same instruction so the same request is retried next cycle.
-        // Freeze IF/ID/EX/MEM. WB already committed this cycle.
-        WB_ = PipeReg{};
-    } else if (squash) {
-        WB_ = MEM_;
-        MEM_ = EX_;
-        EX_ = PipeReg{};
-        ID_ = PipeReg{};
-        IF_ = PipeReg{};
-        pc_ = newPC;
-    } else if (rawStall) {
-        WB_ = MEM_;
-        MEM_ = EX_;
-        EX_ = PipeReg{}; // bubble
-        // ID and IF stay in place
-    } else {
-        WB_ = MEM_;
-        MEM_ = EX_;
-        EX_ = ID_;
-        ID_ = IF_;
-        IF_ = PipeReg{};
-        processIF(false);
-    }
-
-    std::ostringstream oss;
-    oss << UI::formatCycleHeader(cycles_, lastEvent_);
-    oss << UI::formatPipeline(
-        IF_.valid ? IF_.inst.toString() : "-",
-        ID_.valid ? ID_.inst.toString() : "-",
-        EX_.valid ? EX_.inst.toString() : "-",
-        MEM_.valid ? MEM_.inst.toString() : "-",
-        WB_.valid ? WB_.inst.toString() : "-"
-    );
-    oss << UI::formatStatusBar(memory_.busy(), memory_.remainingCycles(), pc_);
-    oss << "╚════════════════════════════════════════════════════════════════╝\n";
-    return UI::prettyPrint(oss.str());
+    return "OK";
 }
 
-std::string Simulator::run() {
-    if (program_.empty()) {
-        return "No Program Loaded.";
-    }
-
-    std::ostringstream oss;
-    oss << UI::formatProgramStart();
-
-    while (!halted_ || IF_.valid || ID_.valid || EX_.valid || MEM_.valid || WB_.valid ||
-           pc_ < program_.size()) {
-        oss << step() << "\n";
-
-        if (halted_ && !IF_.valid && !ID_.valid && !EX_.valid && !MEM_.valid && !WB_.valid &&
-            pc_ >= program_.size()) {
-            break;
+std::string Simulator::run(uint64_t maxCycles) {
+    uint64_t start = cycles_;
+    while (!halted_ && (cycles_ - start) < maxCycles) {
+        step();
+        if (mode_ == ExecMode::NO_PIPE_NO_CACHE || mode_ == ExecMode::NO_PIPE_CACHE) {
+            if (seq_.phase == SeqState::Phase::HALTED) break;
         }
     }
-
-    oss << UI::formatCompletionBanner(cycles_, dumpRegs());
-    oss << UI::formatProgramEnd();
-    return oss.str();
+    return halted_ ? "HALTED" : "Stopped at cycle limit";
 }
 
-// ----------------------
-// Demo 1 manual commands
-// ----------------------
+SimulatorSnapshot Simulator::getSnapshot(uint32_t memStart, uint32_t memLines) const {
+    SimulatorSnapshot s;
+    s.cycles = cycles_;
+    s.pc = pc_;
+    s.halted = halted_;
+    s.zFlag = status_.Z;
+    s.mode = modeString();
+    s.regs = regs_;
 
-std::string Simulator::handleRead(Address address, Stage stage) {
-    if (stage == Stage::NONE) {
-        return "ERROR: stage must be IF or MEM";
+    auto fmtPipe = [](const PipeReg& p) {
+        return p.valid ? ("PC=" + std::to_string(p.pc) + "  " + p.inst.toString()) : std::string("<empty>");
+    };
+
+    s.ifStage = fmtPipe(IF_);
+    s.idStage = fmtPipe(ID_);
+    s.exStage = fmtPipe(EX_);
+    s.memStage = fmtPipe(MEM_);
+    s.wbStage = fmtPipe(WB_);
+
+    s.l1Hits = l1_.hits();
+    s.l1Misses = l1_.misses();
+    s.l2Hits = l2_.hits();
+    s.l2Misses = l2_.misses();
+
+    for (uint32_t i = 0; i < L1_NUM_LINES; ++i) {
+        SnapshotCacheRow row;
+        row.index = i;
+        const auto* line = l1_.getLine(i);
+        if (line) {
+            row.valid = line->valid;
+            row.dirty = line->dirty;
+            row.tag = line->tag;
+            row.data = line->data.words;
+        }
+        s.l1Rows.push_back(row);
     }
 
-    ++cycles_;
-    auto res = cache_.read(address, stage);
-
-    std::ostringstream oss;
-    oss << "[cycle " << cycles_ << "] "
-        << "R " << address << " " << ::stageToString(stage) << " -> ";
-
-    if (res.status == AccessStatus::WAIT) {
-        oss << "wait";
-    } else if (res.status == AccessStatus::DONE) {
-        uint32_t off = (address % RAM_WORDS) % WORDS_PER_LINE;
-        oss << "done, word=" << res.line.words[off];
-    } else {
-        oss << "error";
+    for (uint32_t i = 0; i < L2_NUM_LINES; ++i) {
+        SnapshotCacheRow row;
+        row.index = i;
+        const auto* line = l2_.getLine(i);
+        if (line) {
+            row.valid = line->valid;
+            row.dirty = line->dirty;
+            row.tag = line->tag;
+            row.data = line->data.words;
+        }
+        s.l2Rows.push_back(row);
     }
 
-    oss << " | " << res.message;
-    return oss.str();
+    for (uint32_t i = 0; i < memLines; ++i) {
+        MemoryRow row;
+        row.baseAddress = memStart + i * WORDS_PER_LINE;
+        for (uint32_t j = 0; j < WORDS_PER_LINE; ++j) {
+            row.data[j] = memory_.peekWord(row.baseAddress + j);
+        }
+        s.memoryRows.push_back(row);
+    }
+
+    return s;
 }
 
-std::string Simulator::handleWrite(Word value, Address address, Stage stage) {
-    if (stage == Stage::NONE) {
-        return "ERROR: stage must be IF or MEM";
-    }
-
-    ++cycles_;
-    auto res = cache_.write(address, value, stage);
-
-    std::ostringstream oss;
-    oss << "[cycle " << cycles_ << "] "
-        << "W " << value << " " << address << " " << ::stageToString(stage) << " -> ";
-
-    if (res.status == AccessStatus::WAIT) {
-        oss << "wait";
-    } else if (res.status == AccessStatus::DONE) {
-        oss << "done";
-    } else {
-        oss << "error";
-    }
-
-    oss << " | " << res.message;
-    return oss.str();
+std::string Simulator::dumpRegs() const { return UI::formatRegisters(getSnapshot()); }
+std::string Simulator::dumpPipeline() const { return UI::formatPipeline(getSnapshot()); }
+std::string Simulator::dumpMemoryRange(Address start, Address count) const {
+    return UI::formatMemory(getSnapshot(start, (count + WORDS_PER_LINE - 1) / WORDS_PER_LINE).memoryRows);
 }
-
-std::string Simulator::handleView(int level, uint32_t line) const {
-    std::ostringstream oss;
-
-    if (level == 0) {
-        auto ramLine = memory_.viewLine(line);
-        oss << "V 0 " << line << " -> RAM line " << line
-            << " (words in line available via memory interface)";
-        return oss.str();
-    }
-
-    if (level == 1) {
-        const auto& c = cache_.viewLine(line);
-        oss << "V 1 " << line
-            << " -> CACHE line " << (line % CACHE_LINES)
-            << " | tag=" << c.tag
-            << " valid=" << (c.valid ? 1 : 0)
-            << " dirty=" << (c.dirty ? 1 : 0);
-        return oss.str();
-    }
-
-    return "ERROR: level must be 0 (RAM) or 1 (cache)";
-}
-
-std::string Simulator::handleHelp() const {
-    return
-        "Commands:\n"
-        "  R <address> <stage>         e.g. R 12 IF\n"
-        "  W <value> <address> <stage> e.g. W 99 12 MEM\n"
-        "  V <level> <line>            level 0=RAM, 1=cache\n"
-        "  S                           show status\n"
-        "  LOADPROG <file>             load program file\n"
-        "  STEP                        execute one clock cycle\n"
-        "  RUN                         run to completion\n"
-        "  REGS                        show registers\n"
-        "  MEMRANGE <start> <count>    show memory range\n"
-        "  H                           help\n"
-        "  Q                           quit";
-}
-
-std::string Simulator::handleStatus() const {
-    std::ostringstream oss;
-    oss << "Status:\n"
-        << "  cycle_count=" << cycles_ << "\n"
-        << "  memory_busy=" << (memory_.busy() ? "YES" : "NO") << "\n"
-        << "  memory_active_stage=" << ::stageToString(memory_.activeStage()) << "\n"
-        << "  memory_remaining=" << memory_.remainingCycles() << "\n"
-        << "  cache_hits=" << cache_.hits() << "\n"
-        << "  cache_misses=" << cache_.misses() << "\n"
-        << "  cache_reads=" << cache_.reads() << "\n"
-        << "  cache_writes=" << cache_.writes() << "\n"
-        << "  last_event=" << lastEvent_ << "\n"
-        << dumpPipeline();
-    return oss.str();
-}
+std::string Simulator::dumpCacheL1() const { return UI::formatCacheRows(getSnapshot().l1Rows, "L1 Cache"); }
+std::string Simulator::dumpCacheL2() const { return UI::formatCacheRows(getSnapshot().l2Rows, "L2 Cache"); }
+std::string Simulator::handleStatus() const { return UI::formatSnapshot(getSnapshot()); }

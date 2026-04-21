@@ -1,11 +1,11 @@
 #pragma once
-#include "L2Cache.h"
+#include "Memory.h"
 #include "Types.h"
 #include <array>
 
-class Cache {
+class L2Cache {
 public:
-    explicit Cache(L2Cache& l2);
+    explicit L2Cache(Memory& memory);
 
     void reset();
 
@@ -19,8 +19,8 @@ public:
     uint64_t misses() const { return misses_; }
 
 private:
-    L2Cache& l2_;
-    std::array<CacheLine, L1_NUM_LINES> lines_{};
+    Memory& memory_;
+    std::array<CacheLine, L2_NUM_LINES> lines_{};
     uint64_t hits_ = 0;
     uint64_t misses_ = 0;
 };

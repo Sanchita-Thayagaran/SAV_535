@@ -1,9 +1,10 @@
 #pragma once
-#include "Instruction.h"
-#include <vector>
 #include <string>
+#include <vector>
 
-class Parser {
-public:
-    static std::vector<Instruction> parseFile(const std::string& filename);
-};
+namespace Parser {
+std::string trim(const std::string& s);
+std::string stripComment(const std::string& s);
+std::vector<std::string> tokenize(const std::string& s);
+std::string upper(const std::string& s);
+}
