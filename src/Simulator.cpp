@@ -1,5 +1,6 @@
 #include "Simulator.h"
 #include "UI.h"
+#include <algorithm>
 #include <climits>
 #include <sstream>
 #include <stdexcept>
@@ -520,6 +521,48 @@ std::string Simulator::run(uint64_t maxCycles) {
         }
     }
     return halted_ ? "HALTED" : "Stopped at cycle limit";
+}
+
+std::string Simulator::runUntilBreakpoint(uint64_t maxCycles) {
+    uint64_t start = cycles_;
+    while (!halted_ && (cycles_ - start) < maxCycles) {
+        // Check if current PC is a breakpoint
+        if (hasBreakpoint(pc_)) {
+            return "Hit breakpoint at PC=" + std::to_string(pc_);
+        }
+        step();
+        if (mode_ == ExecMode::NO_PIPE_NO_CACHE || mode_ == ExecMode::NO_PIPE_CACHE) {
+            if (seq_.phase == SeqState::Phase::HALTED) break;
+        }
+    }
+    if (halted_) return "HALTED";
+    if ((cycles_ - start) >= maxCycles) return "Stopped at cycle limit";
+    return "Run complete";
+}
+
+void Simulator::setBreakpoint(uint32_t address) {
+    if (!hasBreakpoint(address)) {
+        breakpoints_.push_back(address);
+    }
+}
+
+void Simulator::clearBreakpoint(uint32_t address) {
+    breakpoints_.erase(
+        std::remove(breakpoints_.begin(), breakpoints_.end(), address),
+        breakpoints_.end()
+    );
+}
+
+void Simulator::clearAllBreakpoints() {
+    breakpoints_.clear();
+}
+
+bool Simulator::hasBreakpoint(uint32_t address) const {
+    return std::find(breakpoints_.begin(), breakpoints_.end(), address) != breakpoints_.end();
+}
+
+std::vector<uint32_t> Simulator::getBreakpoints() const {
+    return breakpoints_;
 }
 
 SimulatorSnapshot Simulator::getSnapshot(uint32_t memStart, uint32_t memLines) const {

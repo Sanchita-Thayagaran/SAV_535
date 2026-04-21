@@ -71,6 +71,13 @@ public:
 
     std::string step();
     std::string run(uint64_t maxCycles = 500000);
+    std::string runUntilBreakpoint(uint64_t maxCycles = 500000);
+
+    void setBreakpoint(uint32_t address);
+    void clearBreakpoint(uint32_t address);
+    void clearAllBreakpoints();
+    bool hasBreakpoint(uint32_t address) const;
+    std::vector<uint32_t> getBreakpoints() const;
 
     SimulatorSnapshot getSnapshot(uint32_t memStart = 0, uint32_t memLines = 16) const;
 
@@ -97,6 +104,7 @@ private:
     ExecMode mode_ = ExecMode::PIPE_CACHE;
 
     PipeReg IF_, ID_, EX_, MEM_, WB_;
+    std::vector<uint32_t> breakpoints_;
 
     struct HierarchyPort {
         bool busy = false;
