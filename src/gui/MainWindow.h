@@ -20,6 +20,7 @@ public:
 private slots:
     void onLoadAsm();
     void onStep();
+    void onStep10();
     void onRun();
     void onRunToBreakpoint();
     void onReset();
@@ -38,6 +39,7 @@ private:
     // Control buttons
     QPushButton* loadButton_ = nullptr;
     QPushButton* stepButton_ = nullptr;
+    QPushButton* step10Button_ = nullptr;
     QPushButton* runButton_ = nullptr;
     QPushButton* runBpButton_ = nullptr;
     QPushButton* resetButton_ = nullptr;

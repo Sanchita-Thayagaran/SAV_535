@@ -14,6 +14,7 @@
 #include <QSpinBox>
 #include <QTableWidget>
 #include <QVBoxLayout>
+#include <QFrame>
 #include <QWidget>
 #include <QFont>
 #include <QGraphicsDropShadowEffect>
@@ -143,12 +144,14 @@ void MainWindow::buildUi() {
 
     loadButton_ = new QPushButton("📁 Load Program");
     stepButton_ = new QPushButton("⏯ Step");
+    step10Button_ = new QPushButton("⏭ Step ×10");
     runButton_ = new QPushButton("▶ Run");
     runBpButton_ = new QPushButton("⏸ Run to BP");
     resetButton_ = new QPushButton("🔄 Reset");
     
     loadButton_->setStyleSheet(buttonStyle);
     stepButton_->setStyleSheet(buttonStyle);
+    step10Button_->setStyleSheet(buttonStyle);
     runButton_->setStyleSheet(buttonStyle);
     runBpButton_->setStyleSheet(buttonStyle);
     resetButton_->setStyleSheet(resetButtonStyle);
@@ -188,6 +191,7 @@ void MainWindow::buildUi() {
 
     controlLayout->addWidget(loadButton_);
     controlLayout->addWidget(stepButton_);
+    controlLayout->addWidget(step10Button_);
     controlLayout->addWidget(runButton_);
     controlLayout->addWidget(runBpButton_);
     controlLayout->addWidget(resetButton_);
@@ -286,27 +290,47 @@ void MainWindow::buildUi() {
     auto* gridLayout = new QGridLayout();
     gridLayout->setSpacing(16);
 
-    QString groupBoxStyle = 
-        "QGroupBox { "
-        "   background-color: white; "
-        "   border-radius: 12px; "
-        "   padding-top: 28px; "
-        "   border: 1px solid #e0e0e0; "
-        "   font-size: 14px; "
-        "   font-weight: 700; "
-        "   color: #2c3e50; "
-        "} "
-        "QGroupBox::title { "
-        "   subcontrol-origin: margin; "
-        "   subcontrol-position: top left; "
-        "   padding: 10px 16px; "
-        "   background: qlineargradient(x1:0, y1:0, x2:1, y2:0, "
-        "       stop:0 #667eea, stop:1 #764ba2); "
-        "   color: white; "
-        "   border-radius: 8px; "
-        "   margin-left: 12px; "
-        "   margin-top: 8px; "
+    // Shared styles for uniform panel cards
+    QString panelFrameStyle =
+        "QFrame {"
+        "   background-color: white;"
+        "   border-radius: 12px;"
+        "   border: 1px solid #e0e0e0;"
         "}";
+    QString panelHeaderStyle =
+        "QWidget {"
+        "   background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #667eea, stop:1 #764ba2);"
+        "   border-top-left-radius: 10px;"
+        "   border-top-right-radius: 10px;"
+        "}";
+    QString panelTitleStyle =
+        "QLabel { color: white; font-size: 14px; font-weight: 700; background: transparent; }";
+
+    auto makePanelFrame = [&](const QString& title) -> std::pair<QFrame*, QVBoxLayout*> {
+        auto* frame = new QFrame();
+        frame->setStyleSheet(panelFrameStyle);
+        auto* vbox = new QVBoxLayout();
+        vbox->setSpacing(8);
+        vbox->setContentsMargins(0, 0, 0, 16);
+        auto* header = new QWidget();
+        header->setStyleSheet(panelHeaderStyle);
+        auto* hdr = new QHBoxLayout(header);
+        hdr->setContentsMargins(16, 10, 16, 10);
+        auto* lbl = new QLabel(title);
+        lbl->setStyleSheet(panelTitleStyle);
+        hdr->addWidget(lbl);
+        hdr->addStretch();
+        vbox->addWidget(header);
+        return {frame, vbox};
+    };
+
+    auto wrapContent = [](QWidget* w, QVBoxLayout* vbox, int l=16, int t=4, int r=16, int b=0) {
+        auto* wrapper = new QWidget();
+        auto* wl = new QVBoxLayout(wrapper);
+        wl->setContentsMargins(l, t, r, b);
+        wl->addWidget(w);
+        vbox->addWidget(wrapper);
+    };
 
     QString tableStyle = 
         "QTableWidget { "
@@ -339,29 +363,23 @@ void MainWindow::buildUi() {
         "}";
 
     // Registers
-    auto* regGroup = new QGroupBox("📋 Registers");
-    regGroup->setStyleSheet(groupBoxStyle);
-    auto* regLayout = new QVBoxLayout();
-    regLayout->setSpacing(8);
+    auto [regGroup, regLayout] = makePanelFrame("\U0001F4CB  Registers");
     regTable_ = new QTableWidget(16, 2);
     regTable_->setHorizontalHeaderLabels({"Register", "Value"});
     regTable_->horizontalHeader()->setStretchLastSection(true);
     regTable_->setMaximumHeight(450);
     regTable_->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
     regTable_->setStyleSheet(tableStyle);
-    regLayout->addWidget(regTable_);
-    regLayout->setContentsMargins(16, 12, 16, 16);
+    wrapContent(regTable_, regLayout);
     regGroup->setLayout(regLayout);
     gridLayout->addWidget(regGroup, 0, 0, 2, 1);
 
     // Pipeline
-    auto* pipeGroup = new QGroupBox("⚙️ Pipeline State");
-    pipeGroup->setStyleSheet(groupBoxStyle);
-    auto* pipeLayout = new QVBoxLayout();
-    pipeLayout->setSpacing(8);
+    auto [pipeGroup, pipeLayout] = makePanelFrame("⚙️  Pipeline State");
     pipelineView_ = new QPlainTextEdit();
     pipelineView_->setReadOnly(true);
-    pipelineView_->setMinimumHeight(200);
+    pipelineView_->setMinimumHeight(160);
+    pipelineView_->setMaximumHeight(200);
     #ifdef Q_OS_MAC
         QFont monoFont("Menlo", 12);
     #else
@@ -378,30 +396,25 @@ void MainWindow::buildUi() {
         "   line-height: 1.5; "
         "}"
     );
-    pipeLayout->addWidget(pipelineView_);
-    pipeLayout->setContentsMargins(16, 12, 16, 16);
+    wrapContent(pipelineView_, pipeLayout);
     pipeGroup->setLayout(pipeLayout);
     gridLayout->addWidget(pipeGroup, 0, 1);
 
     // L1 Cache
-    auto* l1Group = new QGroupBox("💾 L1 Cache (8 lines × 4 words)");
-    l1Group->setStyleSheet(groupBoxStyle);
-    auto* l1Layout = new QVBoxLayout();
-    l1Layout->setSpacing(8);
+    auto [l1Group, l1Layout] = makePanelFrame("\U0001F4BE  L1 Cache (8 lines × 4 words)");
     l1Table_ = new QTableWidget(L1_NUM_LINES, 5);
     l1Table_->setHorizontalHeaderLabels({"Index", "Valid", "Tag", "Dirty", "Data [4 words]"});
     l1Table_->horizontalHeader()->setStretchLastSection(true);
+    l1Table_->setMinimumHeight(240);
+    l1Table_->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    l1Table_->verticalHeader()->setDefaultSectionSize(26);
     l1Table_->setStyleSheet(tableStyle);
-    l1Layout->addWidget(l1Table_);
-    l1Layout->setContentsMargins(16, 12, 16, 16);
+    wrapContent(l1Table_, l1Layout);
     l1Group->setLayout(l1Layout);
     gridLayout->addWidget(l1Group, 1, 1);
 
     // L2 Cache
-    auto* l2Group = new QGroupBox("💾 L2 Cache (32 lines × 4 words)");
-    l2Group->setStyleSheet(groupBoxStyle);
-    auto* l2Layout = new QVBoxLayout();
-    l2Layout->setSpacing(8);
+    auto [l2Group, l2Layout] = makePanelFrame("\U0001F4BE  L2 Cache (32 lines × 4 words)");
     l2Table_ = new QTableWidget(L2_NUM_LINES, 5);
     l2Table_->setHorizontalHeaderLabels({"Index", "Valid", "Tag", "Dirty", "Data [4 words]"});
     l2Table_->horizontalHeader()->setStretchLastSection(true);
@@ -409,37 +422,71 @@ void MainWindow::buildUi() {
     l2Table_->setMinimumHeight(350);
     l2Table_->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOn);
     l2Table_->setStyleSheet(tableStyle);
-    l2Layout->addWidget(l2Table_);
-    l2Layout->setContentsMargins(16, 12, 16, 16);
+    wrapContent(l2Table_, l2Layout);
     l2Group->setLayout(l2Layout);
     gridLayout->addWidget(l2Group, 2, 0);
 
-    // Memory
-    auto* memGroup = new QGroupBox("🗄 Main Memory");
-    memGroup->setStyleSheet(groupBoxStyle);
+    // Memory - header bar includes the Start Address spinner on the right
+    auto* memGroup = new QFrame();
+    memGroup->setStyleSheet(panelFrameStyle);
     auto* memLayout = new QVBoxLayout();
     memLayout->setSpacing(8);
-    auto* memControlLayout = new QHBoxLayout();
-    auto* memLabel = new QLabel("Start Address:");
-    memLabel->setStyleSheet("QLabel { color: #586069; font-size: 13px; font-weight: 600; background: transparent; }");
+    memLayout->setContentsMargins(0, 0, 0, 16);
+
+    auto* memHeader = new QWidget();
+    memHeader->setStyleSheet(panelHeaderStyle);
+    auto* memHeaderLayout = new QHBoxLayout(memHeader);
+    memHeaderLayout->setContentsMargins(16, 10, 12, 10);
+    memHeaderLayout->setSpacing(10);
+
+    auto* memTitleLabel = new QLabel("\U0001F5C4  Main Memory");
+    memTitleLabel->setStyleSheet(panelTitleStyle);
+
+    auto* memAddrLabel = new QLabel("Start Address:");
+    memAddrLabel->setStyleSheet(
+        "QLabel { color: rgba(255,255,255,0.88); font-size: 12px; font-weight: 600; background: transparent; }"
+    );
+
     memStartSpin_ = new QSpinBox();
     memStartSpin_->setRange(0, 32768);
     memStartSpin_->setValue(0);
     memStartSpin_->setSingleStep(16);
+    memStartSpin_->setFixedWidth(105);
     memStartSpin_->setStyleSheet(
-        "QSpinBox { "
-        "   padding: 6px 10px; "
-        "   background-color: white; "
-        "   border: 2px solid #e1e4e8; "
-        "   border-radius: 6px; "
-        "   font-size: 13px; "
+        "QSpinBox {"
+        "   padding: 3px 5px;"
+        "   background-color: rgba(255,255,255,0.92);"
+        "   border: none;"
+        "   border-radius: 5px;"
+        "   font-size: 13px;"
+        "   color: #24292e;"
         "}"
+        "QSpinBox::up-button {"
+        "   subcontrol-origin: border;"
+        "   subcontrol-position: top right;"
+        "   width: 18px;"
+        "   border-left: 1px solid #ccc;"
+        "   border-top-right-radius: 4px;"
+        "   background: rgba(255,255,255,0.6);"
+        "}"
+        "QSpinBox::down-button {"
+        "   subcontrol-origin: border;"
+        "   subcontrol-position: bottom right;"
+        "   width: 18px;"
+        "   border-left: 1px solid #ccc;"
+        "   border-bottom-right-radius: 4px;"
+        "   background: rgba(255,255,255,0.6);"
+        "}"
+        "QSpinBox::up-arrow { width: 7px; height: 7px; }"
+        "QSpinBox::down-arrow { width: 7px; height: 7px; }"
     );
-    memControlLayout->addWidget(memLabel);
-    memControlLayout->addWidget(memStartSpin_);
-    memControlLayout->addStretch();
-    memLayout->addLayout(memControlLayout);
-    
+
+    memHeaderLayout->addWidget(memTitleLabel);
+    memHeaderLayout->addStretch();
+    memHeaderLayout->addWidget(memAddrLabel);
+    memHeaderLayout->addWidget(memStartSpin_);
+    memLayout->addWidget(memHeader);
+
     memTable_ = new QTableWidget(16, 2);
     memTable_->setHorizontalHeaderLabels({"Address", "Data [4 words]"});
     memTable_->horizontalHeader()->setStretchLastSection(true);
@@ -447,8 +494,8 @@ void MainWindow::buildUi() {
     memTable_->setMinimumHeight(350);
     memTable_->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOn);
     memTable_->setStyleSheet(tableStyle);
-    memLayout->addWidget(memTable_);
-    memLayout->setContentsMargins(16, 12, 16, 16);
+    wrapContent(memTable_, memLayout);
+
     memGroup->setLayout(memLayout);
     gridLayout->addWidget(memGroup, 2, 1);
 
@@ -482,6 +529,7 @@ void MainWindow::buildUi() {
     // ========== CONNECTIONS ==========
     connect(loadButton_, &QPushButton::clicked, this, &MainWindow::onLoadAsm);
     connect(stepButton_, &QPushButton::clicked, this, &MainWindow::onStep);
+    connect(step10Button_, &QPushButton::clicked, this, &MainWindow::onStep10);
     connect(runButton_, &QPushButton::clicked, this, &MainWindow::onRun);
     connect(runBpButton_, &QPushButton::clicked, this, &MainWindow::onRunToBreakpoint);
     connect(resetButton_, &QPushButton::clicked, this, &MainWindow::onReset);
@@ -508,19 +556,29 @@ void MainWindow::refreshView() {
     }
 
     // Update pipeline
-    QString pipeText = QString(
+    auto pad = [](const std::string& s) {
+        return QString::fromStdString(s).left(35).leftJustified(35);
+    };
+
+    // Show in-flight fetch info in the IF line when the stage is empty but a fetch is pending
+    QString ifDisplay;
+    if (snap.fetchInFlight && snap.ifStage == "<empty>") {
+        ifDisplay = QString("[Fetching PC=%1, %2 cyc left]")
+                        .arg(snap.fetchPc)
+                        .arg(snap.fetchRemaining)
+                        .left(35).leftJustified(35);
+    } else {
+        ifDisplay = pad(snap.ifStage);
+    }
+
+    QString pipeText =
         "┌─────────────────────────────────────────┐\n"
-        "│ IF  : %-35s │\n"
-        "│ ID  : %-35s │\n"
-        "│ EX  : %-35s │\n"
-        "│ MEM : %-35s │\n"
-        "│ WB  : %-35s │\n"
-        "└─────────────────────────────────────────┘"
-    ).arg(QString::fromStdString(snap.ifStage).left(35))
-     .arg(QString::fromStdString(snap.idStage).left(35))
-     .arg(QString::fromStdString(snap.exStage).left(35))
-     .arg(QString::fromStdString(snap.memStage).left(35))
-     .arg(QString::fromStdString(snap.wbStage).left(35));
+        "│ IF  : " + ifDisplay            + " │\n" +
+        "│ ID  : " + pad(snap.idStage)    + " │\n" +
+        "│ EX  : " + pad(snap.exStage)    + " │\n" +
+        "│ MEM : " + pad(snap.memStage)   + " │\n" +
+        "│ WB  : " + pad(snap.wbStage)    + " │\n" +
+        "└─────────────────────────────────────────┘";
     pipelineView_->setPlainText(pipeText);
 
     // Update L1 cache
@@ -613,6 +671,11 @@ void MainWindow::onLoadAsm() {
 
 void MainWindow::onStep() {
     sim_.step();
+    refreshView();
+}
+
+void MainWindow::onStep10() {
+    for (int i = 0; i < 10; ++i) sim_.step();
     refreshView();
 }
 

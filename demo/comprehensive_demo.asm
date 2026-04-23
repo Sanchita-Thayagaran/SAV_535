@@ -1,4 +1,4 @@
-# Comprehensive Demo Program for CS 535 - April 17, 2026
+# Comprehensive Demo Program
 # Tests ALL instruction classes for complete ISA validation
 
 main:

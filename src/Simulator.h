@@ -32,6 +32,7 @@ struct PipeReg {
     int32_t memAddr = 0;
     int32_t memData = 0;
     int32_t wbValue = 0;
+    bool memDone = false;  // NEW: tracks if memory access completed
 };
 
 struct SimulatorSnapshot {
@@ -47,6 +48,10 @@ struct SimulatorSnapshot {
     std::string exStage;
     std::string memStage;
     std::string wbStage;
+
+    bool fetchInFlight = false;
+    uint32_t fetchPc = 0;
+    uint32_t fetchRemaining = 0;
 
     std::vector<SnapshotCacheRow> l1Rows;
     std::vector<SnapshotCacheRow> l2Rows;
@@ -96,6 +101,7 @@ private:
     uint64_t cycles_ = 0;
     uint32_t pc_ = 0;
     bool halted_ = false;
+    bool haltPending_ = false;
     StatusRegister status_{};
     std::array<int32_t, 16> regs_{};
 

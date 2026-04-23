@@ -50,6 +50,7 @@ void Simulator::reset() {
     cycles_ = 0;
     pc_ = 0;
     halted_ = false;
+    haltPending_ = false;
     programBase_ = 0;
     programSize_ = 0;
     IF_ = {};
@@ -188,8 +189,10 @@ void Simulator::advanceHierarchy() {
             break;
         case HierarchyPort::Kind::LOAD:
             MEM_.wbValue = static_cast<int32_t>(hierarchyPort_.result.word);
+            MEM_.memDone = true;  // Mark load as complete
             break;
         case HierarchyPort::Kind::STORE:
+            MEM_.memDone = true;  // Mark store as complete
             break;
         case HierarchyPort::Kind::SEQ_FETCH:
             seq_.raw = hierarchyPort_.result.word;
@@ -212,9 +215,12 @@ void Simulator::advanceHierarchy() {
 bool Simulator::pendingDestInPipe(int reg) const {
     if (reg == 0) return false;
     auto matches = [&](const PipeReg& p) {
-        return p.valid && p.inst.writesRegister() && p.inst.rd == reg;
+        if (!p.valid || !p.inst.writesRegister()) return false;
+        // JAL writes to R15 implicitly, not via rd
+        int destReg = (p.inst.op == Opcode::JAL) ? 15 : p.inst.rd;
+        return destReg == reg;
     };
-    return matches(EX_) || matches(MEM_);
+    return matches(EX_) || matches(MEM_) || matches(WB_);
 }
 
 bool Simulator::hasRawHazard(const Instruction& inst) const {
@@ -253,24 +259,43 @@ void Simulator::doMEM(bool cachesEnabled, bool& stall) {
     if (!MEM_.valid) return;
 
     if (MEM_.inst.isLoad()) {
-        if (MEM_.wbValue == 0 && !hierarchyPort_.busy) {
+        // If port is busy with our request, keep waiting
+        if (hierarchyPort_.busy && hierarchyPort_.owner == Stage::MEM_STAGE) {
+            stall = true;
+            return;
+        }
+        // If memory op completed (flagged by advanceHierarchy), move to WB
+        if (MEM_.memDone) {
+            WB_ = MEM_;
+            MEM_ = {};
+            return;
+        }
+        // Need to start a new request
+        if (!hierarchyPort_.busy) {
             if (!startHierarchyRequest(Stage::MEM_STAGE, HierarchyPort::Kind::LOAD,
                                        static_cast<Address>(MEM_.memAddr), cachesEnabled,
                                        0, MEM_.inst.rd, MEM_.pc)) {
                 stall = true;
                 return;
             }
-        }
-        if (hierarchyPort_.busy && hierarchyPort_.owner == Stage::MEM_STAGE) {
             stall = true;
             return;
         }
-        WB_ = MEM_;
-        MEM_ = {};
+        // Port is busy with something else, stall
+        stall = true;
         return;
     }
 
     if (MEM_.inst.isStore()) {
+        if (hierarchyPort_.busy && hierarchyPort_.owner == Stage::MEM_STAGE) {
+            stall = true;
+            return;
+        }
+        if (MEM_.memDone) {
+            WB_ = {};
+            MEM_ = {};
+            return;
+        }
         if (!hierarchyPort_.busy) {
             if (!startHierarchyRequest(Stage::MEM_STAGE, HierarchyPort::Kind::STORE,
                                        static_cast<Address>(MEM_.memAddr), cachesEnabled,
@@ -278,13 +303,10 @@ void Simulator::doMEM(bool cachesEnabled, bool& stall) {
                 stall = true;
                 return;
             }
-        }
-        if (hierarchyPort_.busy && hierarchyPort_.owner == Stage::MEM_STAGE) {
             stall = true;
             return;
         }
-        WB_ = {};
-        MEM_ = {};
+        stall = true;
         return;
     }
 
@@ -302,6 +324,12 @@ void Simulator::doEX(bool& squash, uint32_t& newPC) {
     const int32_t b = EX_.opB;
 
     if (inst.op == Opcode::HALT) {
+        // Flush speculative instructions fetched past HALT
+        IF_ = {};
+        ID_ = {};
+        if (hierarchyPort_.busy && hierarchyPort_.owner == Stage::IF_STAGE) {
+            hierarchyPort_ = {};
+        }
         MEM_ = EX_;
         EX_ = {};
         return;
@@ -350,6 +378,14 @@ void Simulator::doEX(bool& squash, uint32_t& newPC) {
 void Simulator::doID(bool& stall) {
     stall = false;
     if (!ID_.valid) return;
+    if (ID_.inst.op == Opcode::HALT) {
+        // Flush speculative instructions fetched past HALT and block further fetches
+        haltPending_ = true;
+        IF_ = {};
+        if (hierarchyPort_.busy && hierarchyPort_.owner == Stage::IF_STAGE) {
+            hierarchyPort_ = {};
+        }
+    }
     if (hasRawHazard(ID_.inst)) {
         stall = true;
         return;
@@ -362,7 +398,7 @@ void Simulator::doID(bool& stall) {
 }
 
 void Simulator::doIF(bool cachesEnabled, bool stall) {
-    if (stall || halted_ || IF_.valid || hierarchyPort_.busy) return;
+    if (stall || halted_ || haltPending_ || IF_.valid || hierarchyPort_.busy) return;
     startHierarchyRequest(Stage::IF_STAGE, HierarchyPort::Kind::FETCH, pc_, cachesEnabled, 0, 0, pc_);
     if (!hierarchyPort_.busy) return;
 }
@@ -396,7 +432,13 @@ void Simulator::stepPipelineCycle(bool cachesEnabled) {
     if (squash) {
         IF_ = {};
         ID_ = {};
+        EX_ = {};  // ← ADD THIS: clear EX too, since doID may have moved wrong-path there
+        haltPending_ = false;  // squashed HALT in ID/IF is no longer pending
         pc_ = newPC;
+        // Cancel any in-flight instruction fetch (wrong-path prefetch)
+        if (hierarchyPort_.busy && hierarchyPort_.owner == Stage::IF_STAGE) {
+            hierarchyPort_ = {};
+        }
     }
 
     doIF(cachesEnabled, idStall);
@@ -583,6 +625,10 @@ SimulatorSnapshot Simulator::getSnapshot(uint32_t memStart, uint32_t memLines) c
     s.exStage = fmtPipe(EX_);
     s.memStage = fmtPipe(MEM_);
     s.wbStage = fmtPipe(WB_);
+
+    s.fetchInFlight = hierarchyPort_.busy && (hierarchyPort_.owner == Stage::IF_STAGE);
+    s.fetchPc = hierarchyPort_.producerPc;
+    s.fetchRemaining = hierarchyPort_.remaining;
 
     s.l1Hits = l1_.hits();
     s.l1Misses = l1_.misses();
