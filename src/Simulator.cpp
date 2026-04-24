@@ -725,7 +725,6 @@ void Simulator::stepPipelineCycle(bool cachesEnabled)
     PipeReg nextMEM = MEM_;
     PipeReg nextWB = WB_;
 
-    // ---------------- WB ----------------
     if (WB_.valid)
     {
         if (WB_.inst.writesRegister())
@@ -744,7 +743,6 @@ void Simulator::stepPipelineCycle(bool cachesEnabled)
         nextWB = {};
     }
 
-    // ---------------- MEM ----------------
     bool memStall = false;
     if (MEM_.valid)
     {
@@ -858,7 +856,6 @@ void Simulator::stepPipelineCycle(bool cachesEnabled)
 
     if (!memStall)
     {
-        // ---------------- EX ----------------
         bool squash = false;
         uint32_t newPC = pc_;
 
@@ -950,7 +947,6 @@ void Simulator::stepPipelineCycle(bool cachesEnabled)
             }
         }
 
-        // ---------------- ID / IF ----------------
         if (squash)
         {
             nextIF = {};
@@ -1039,6 +1035,7 @@ void Simulator::stepPipelineCycle(bool cachesEnabled)
     {
         halted_ = true;
         lastSummary_ = "HALT retired";
+        lastFlags_.clear();
     }
 
     if (programEndReached_ &&
@@ -1047,11 +1044,13 @@ void Simulator::stepPipelineCycle(bool cachesEnabled)
     {
         halted_ = true;
         lastSummary_ = "Program completed";
+        lastFlags_.clear();
     }
 
     ++cycles_;
     regs_[0] = 0;
 }
+
 void Simulator::stepSequentialCycle(bool cachesEnabled)
 {
     if (faulted_)
@@ -1081,6 +1080,7 @@ void Simulator::stepSequentialCycle(bool cachesEnabled)
             halted_ = true;
             seq_.phase = SeqState::Phase::HALTED;
             lastSummary_ = "Program completed";
+            lastFlags_.clear();
             break;
         }
 
@@ -1115,6 +1115,7 @@ void Simulator::stepSequentialCycle(bool cachesEnabled)
             seq_.phase = SeqState::Phase::HALTED;
             seq_.note = "Sequential HALT";
             lastSummary_ = "Sequential HALT";
+            lastFlags_.clear();
             break;
         }
 
