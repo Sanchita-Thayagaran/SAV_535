@@ -73,6 +73,8 @@ void Simulator::reset()
     pc_ = 0;
     halted_ = false;
     haltRequested_ = false;
+    faulted_ = false;
+    programEndReached_ = false;
 
     programBase_ = 0;
     programSize_ = 0;
@@ -91,8 +93,38 @@ void Simulator::reset()
 
     stallThisCycle_ = false;
     squashThisCycle_ = false;
-    lastSummary_ = "";
-    lastFlags_ = "";
+    lastSummary_.clear();
+    lastFlags_.clear();
+    faultMessage_.clear();
+}
+
+bool Simulator::pcInLoadedProgram(uint32_t pc) const
+{
+    return pc >= programBase_ && pc < (programBase_ + programSize_);
+}
+
+uint32_t Simulator::programEnd() const
+{
+    return programBase_ + programSize_;
+}
+
+void Simulator::fault(const std::string &message)
+{
+    faulted_ = true;
+    halted_ = true;
+    haltRequested_ = false;
+    programEndReached_ = false;
+
+    hierarchyPort_ = {};
+    IF_ = {};
+    ID_ = {};
+    EX_ = {};
+    MEM_ = {};
+    WB_ = {};
+
+    lastSummary_ = message;
+    lastFlags_ = "FAULT";
+    faultMessage_ = message;
 }
 
 std::string Simulator::loadProgramWords(const std::vector<uint32_t> &words)
@@ -319,7 +351,7 @@ void Simulator::advanceHierarchy()
             IF_.pc = hierarchyPort_.producerPc;
             IF_.raw = hierarchyPort_.result.word;
             IF_.inst = decodeInstruction(hierarchyPort_.result.word);
-            IF_.note = hierarchyPort_.result.hit ? "[Fetched L1/L2 hit]" : "[Fetched]";
+            IF_.note = hierarchyPort_.result.hit ? "[Fetched hit]" : "[Fetched]";
         }
         break;
 
@@ -399,7 +431,7 @@ Instruction Simulator::fetchAndDecode(uint32_t address, bool cachesEnabled, bool
 
 void Simulator::doWB()
 {
-    if (!WB_.valid)
+    if (!WB_.valid || faulted_)
         return;
 
     if (WB_.inst.writesRegister())
@@ -421,7 +453,7 @@ void Simulator::doWB()
 void Simulator::doMEM(bool cachesEnabled, bool &stall)
 {
     stall = false;
-    if (!MEM_.valid)
+    if (!MEM_.valid || faulted_)
         return;
 
     if (MEM_.inst.isLoad())
@@ -436,7 +468,8 @@ void Simulator::doMEM(bool cachesEnabled, bool &stall)
                                            cachesEnabled,
                                            0,
                                            MEM_.inst.rd,
-                                           MEM_.pc))
+                                           MEM_.pc,
+                                           fetchEpoch_))
                 {
                     stall = true;
                     stallThisCycle_ = true;
@@ -480,7 +513,8 @@ void Simulator::doMEM(bool cachesEnabled, bool &stall)
                                            cachesEnabled,
                                            static_cast<Word>(MEM_.memData),
                                            0,
-                                           MEM_.pc))
+                                           MEM_.pc,
+                                           fetchEpoch_))
                 {
                     stall = true;
                     stallThisCycle_ = true;
@@ -520,7 +554,7 @@ void Simulator::doEX(bool &squash, uint32_t &newPC)
     squash = false;
     newPC = pc_;
 
-    if (!EX_.valid)
+    if (!EX_.valid || faulted_)
         return;
 
     auto &inst = EX_.inst;
@@ -540,10 +574,18 @@ void Simulator::doEX(bool &squash, uint32_t &newPC)
         const bool taken = evalBranch(inst, a, b);
         if (taken)
         {
+            const uint32_t target = EX_.pc + 1 + static_cast<uint32_t>(inst.imm);
+            if (!pcInLoadedProgram(target))
+            {
+                fault("Branch target outside program: PC=" + std::to_string(target));
+                return;
+            }
             squash = true;
-            newPC = EX_.pc + 1 + static_cast<uint32_t>(inst.imm);
+            squashThisCycle_ = true;
+            newPC = target;
             EX_.note = "[Branch taken]";
             lastSummary_ = "Branch taken -> squash";
+            lastFlags_ = "SQUASH";
         }
         else
         {
@@ -555,21 +597,37 @@ void Simulator::doEX(bool &squash, uint32_t &newPC)
 
     if (inst.op == Opcode::J)
     {
+        const uint32_t target = static_cast<uint32_t>(a);
+        if (!pcInLoadedProgram(target))
+        {
+            fault("Jump target outside program: PC=" + std::to_string(target));
+            return;
+        }
         squash = true;
-        newPC = static_cast<uint32_t>(a);
+        squashThisCycle_ = true;
+        newPC = target;
         EX_.note = "[Jump taken]";
         lastSummary_ = "Jump taken -> squash";
+        lastFlags_ = "SQUASH";
         EX_ = {};
         return;
     }
 
     if (inst.op == Opcode::JAL)
     {
+        const uint32_t target = static_cast<uint32_t>(a);
+        if (!pcInLoadedProgram(target))
+        {
+            fault("JAL target outside program: PC=" + std::to_string(target));
+            return;
+        }
         EX_.wbValue = static_cast<int32_t>(EX_.pc + 1);
         squash = true;
-        newPC = static_cast<uint32_t>(a);
+        squashThisCycle_ = true;
+        newPC = target;
         EX_.note = "[JAL taken]";
         lastSummary_ = "JAL taken -> squash";
+        lastFlags_ = "SQUASH";
         MEM_ = EX_;
         EX_ = {};
         return;
@@ -597,7 +655,7 @@ void Simulator::doEX(bool &squash, uint32_t &newPC)
 void Simulator::doID(bool &stall)
 {
     stall = false;
-    if (!ID_.valid)
+    if (!ID_.valid || faulted_)
         return;
 
     if (hasRawHazard(ID_.inst))
@@ -619,8 +677,23 @@ void Simulator::doID(bool &stall)
 
 void Simulator::doIF(bool cachesEnabled, bool stall)
 {
-    if (stall || halted_ || haltRequested_ || IF_.valid || hierarchyPort_.busy)
+    if (stall || halted_ || haltRequested_ || faulted_ || IF_.valid || hierarchyPort_.busy)
         return;
+
+    const uint32_t end = programEnd();
+
+    if (pc_ == end)
+    {
+        programEndReached_ = true;
+        lastSummary_ = "Program end reached, no more fetches";
+        return;
+    }
+
+    if (!pcInLoadedProgram(pc_))
+    {
+        fault("PC escaped loaded program: PC=" + std::to_string(pc_));
+        return;
+    }
 
     startHierarchyRequest(Stage::IF_STAGE,
                           HierarchyPort::Kind::FETCH,
@@ -634,84 +707,363 @@ void Simulator::doIF(bool cachesEnabled, bool stall)
 
 void Simulator::stepPipelineCycle(bool cachesEnabled)
 {
+    if (faulted_)
+        return;
+
     lastSummary_ = "Cycle OK";
     lastFlags_.clear();
     stallThisCycle_ = false;
     squashThisCycle_ = false;
 
     advanceHierarchy();
-
-    doWB();
-
-    bool memStall = false;
-    doMEM(cachesEnabled, memStall);
-    if (memStall)
-    {
-        if (lastFlags_.empty())
-            lastFlags_ = "STALL";
-        ++cycles_;
-        regs_[0] = 0;
+    if (faulted_)
         return;
+
+    PipeReg nextIF = IF_;
+    PipeReg nextID = ID_;
+    PipeReg nextEX = EX_;
+    PipeReg nextMEM = MEM_;
+    PipeReg nextWB = WB_;
+
+    // ---------------- WB ----------------
+    if (WB_.valid)
+    {
+        if (WB_.inst.writesRegister())
+        {
+            const int dest = (WB_.inst.op == Opcode::JAL ? 15 : WB_.inst.rd);
+            writeReg(dest, WB_.wbValue);
+            updateZeroFlagIfNeeded(WB_.inst, WB_.wbValue);
+        }
+
+        if (WB_.inst.op == Opcode::HALT)
+        {
+            haltRequested_ = true;
+            lastSummary_ = "HALT retired";
+        }
+
+        nextWB = {};
     }
 
-    bool squash = false;
-    uint32_t newPC = pc_;
-    doEX(squash, newPC);
-
-    bool idStall = false;
-    doID(idStall);
-
-    if (!idStall && !ID_.valid && IF_.valid)
+    // ---------------- MEM ----------------
+    bool memStall = false;
+    if (MEM_.valid)
     {
-        ID_ = IF_;
-        ID_.note = "[Fetched->ID]";
-        IF_ = {};
-        if (!squash)
+        if (MEM_.inst.isLoad())
         {
-            ++pc_;
+            if (!MEM_.loadStarted)
+            {
+                if (!hierarchyPort_.busy)
+                {
+                    if (!startHierarchyRequest(Stage::MEM_STAGE,
+                                               HierarchyPort::Kind::LOAD,
+                                               static_cast<Address>(MEM_.memAddr),
+                                               cachesEnabled,
+                                               0,
+                                               MEM_.inst.rd,
+                                               MEM_.pc,
+                                               fetchEpoch_))
+                    {
+                        memStall = true;
+                        stallThisCycle_ = true;
+                        lastSummary_ = "MEM stalled starting load";
+                        lastFlags_ = "STALL";
+                    }
+                    else
+                    {
+                        nextMEM.loadStarted = true;
+                        nextMEM.note = "[Load wait]";
+                        memStall = true;
+                        stallThisCycle_ = true;
+                        lastSummary_ = "MEM waiting on load";
+                        lastFlags_ = "STALL";
+                    }
+                }
+                else
+                {
+                    memStall = true;
+                    stallThisCycle_ = true;
+                    lastSummary_ = "MEM waiting on load";
+                    lastFlags_ = "STALL";
+                }
+            }
+            else if (hierarchyPort_.busy && hierarchyPort_.owner == Stage::MEM_STAGE)
+            {
+                memStall = true;
+                stallThisCycle_ = true;
+                lastSummary_ = "MEM waiting on load";
+                lastFlags_ = "STALL";
+            }
+            else
+            {
+                nextWB = MEM_;
+                nextMEM = {};
+            }
+        }
+        else if (MEM_.inst.isStore())
+        {
+            if (!MEM_.storeStarted)
+            {
+                if (!hierarchyPort_.busy)
+                {
+                    if (!startHierarchyRequest(Stage::MEM_STAGE,
+                                               HierarchyPort::Kind::STORE,
+                                               static_cast<Address>(MEM_.memAddr),
+                                               cachesEnabled,
+                                               static_cast<Word>(MEM_.memData),
+                                               0,
+                                               MEM_.pc,
+                                               fetchEpoch_))
+                    {
+                        memStall = true;
+                        stallThisCycle_ = true;
+                        lastSummary_ = "MEM stalled starting store";
+                        lastFlags_ = "STALL";
+                    }
+                    else
+                    {
+                        nextMEM.storeStarted = true;
+                        nextMEM.note = "[Store wait]";
+                        memStall = true;
+                        stallThisCycle_ = true;
+                        lastSummary_ = "MEM waiting on store";
+                        lastFlags_ = "STALL";
+                    }
+                }
+                else
+                {
+                    memStall = true;
+                    stallThisCycle_ = true;
+                    lastSummary_ = "MEM waiting on store";
+                    lastFlags_ = "STALL";
+                }
+            }
+            else if (hierarchyPort_.busy && hierarchyPort_.owner == Stage::MEM_STAGE)
+            {
+                memStall = true;
+                stallThisCycle_ = true;
+                lastSummary_ = "MEM waiting on store";
+                lastFlags_ = "STALL";
+            }
+            else
+            {
+                nextMEM = {};
+            }
+        }
+        else
+        {
+            nextWB = MEM_;
+            nextMEM = {};
         }
     }
 
-    if (squash)
+    if (!memStall)
     {
-        IF_ = {};
-        ID_ = {};
+        // ---------------- EX ----------------
+        bool squash = false;
+        uint32_t newPC = pc_;
 
-        if (hierarchyPort_.busy &&
-            hierarchyPort_.owner == Stage::IF_STAGE &&
-            hierarchyPort_.kind == HierarchyPort::Kind::FETCH)
+        if (EX_.valid)
         {
-            hierarchyPort_ = {};
+            auto inst = EX_.inst;
+            const int32_t a = EX_.opA;
+            const int32_t b = EX_.opB;
+
+            if (inst.op == Opcode::HALT)
+            {
+                PipeReg tmp = EX_;
+                tmp.note = "[HALT in EX]";
+                nextMEM = tmp;
+                nextEX = {};
+            }
+            else if (inst.isBranch())
+            {
+                const bool taken = evalBranch(inst, a, b);
+                if (taken)
+                {
+                    const uint32_t target = EX_.pc + 1 + static_cast<uint32_t>(inst.imm);
+                    if (!pcInLoadedProgram(target))
+                    {
+                        fault("Branch target outside program: PC=" + std::to_string(target));
+                        return;
+                    }
+                    squash = true;
+                    squashThisCycle_ = true;
+                    newPC = target;
+                    lastSummary_ = "Branch taken -> squash";
+                    lastFlags_ = "SQUASH";
+                }
+                nextEX = {};
+            }
+            else if (inst.op == Opcode::J)
+            {
+                const uint32_t target = static_cast<uint32_t>(a);
+                if (!pcInLoadedProgram(target))
+                {
+                    fault("Jump target outside program: PC=" + std::to_string(target));
+                    return;
+                }
+                squash = true;
+                squashThisCycle_ = true;
+                newPC = target;
+                lastSummary_ = "Jump taken -> squash";
+                lastFlags_ = "SQUASH";
+                nextEX = {};
+            }
+            else if (inst.op == Opcode::JAL)
+            {
+                const uint32_t target = static_cast<uint32_t>(a);
+                if (!pcInLoadedProgram(target))
+                {
+                    fault("JAL target outside program: PC=" + std::to_string(target));
+                    return;
+                }
+                PipeReg tmp = EX_;
+                tmp.wbValue = static_cast<int32_t>(EX_.pc + 1);
+                tmp.note = "[JAL taken]";
+                squash = true;
+                squashThisCycle_ = true;
+                newPC = target;
+                lastSummary_ = "JAL taken -> squash";
+                lastFlags_ = "SQUASH";
+                nextMEM = tmp;
+                nextEX = {};
+            }
+            else if (inst.isLoad() || inst.isStore())
+            {
+                PipeReg tmp = EX_;
+                tmp.memAddr = add32(a, inst.imm);
+                if (inst.isStore())
+                {
+                    tmp.memData = readReg(inst.rd);
+                }
+                tmp.note = "[Address computed]";
+                nextMEM = tmp;
+                nextEX = {};
+            }
+            else
+            {
+                PipeReg tmp = EX_;
+                tmp.wbValue = evalALU(inst, a, b);
+                tmp.note = "[ALU done]";
+                nextMEM = tmp;
+                nextEX = {};
+            }
         }
 
-        ++fetchEpoch_;
-        pc_ = newPC;
-        squashThisCycle_ = true;
-        if (!lastFlags_.empty())
-            lastFlags_ += " ";
-        lastFlags_ += "SQUASH";
+        // ---------------- ID / IF ----------------
+        if (squash)
+        {
+            nextIF = {};
+            nextID = {};
+            nextEX = {};
+            pc_ = newPC;
+            programEndReached_ = false;
+
+            if (hierarchyPort_.busy && hierarchyPort_.owner == Stage::IF_STAGE)
+            {
+                hierarchyPort_ = {};
+            }
+            ++fetchEpoch_;
+        }
+        else
+        {
+            bool idStall = false;
+
+            if (ID_.valid)
+            {
+                if (hasRawHazard(ID_.inst))
+                {
+                    idStall = true;
+                    stallThisCycle_ = true;
+                    nextID.note = "[STALL: RAW hazard]";
+                    lastSummary_ = "ID stalled on RAW hazard";
+                    lastFlags_ = "STALL";
+                }
+                else
+                {
+                    PipeReg tmp = ID_;
+                    tmp.opA = readReg(ID_.inst.rs1);
+                    tmp.opB = readReg(ID_.inst.rs2);
+                    tmp.note = "[Decoded]";
+                    nextEX = tmp;
+                    nextID = {};
+                }
+            }
+
+            if (!idStall && !IF_.valid && !hierarchyPort_.busy && !haltRequested_ && !faulted_)
+            {
+                const uint32_t end = programEnd();
+                if (pc_ == end)
+                {
+                    programEndReached_ = true;
+                    lastSummary_ = "Program end reached, no more fetches";
+                }
+                else if (!pcInLoadedProgram(pc_))
+                {
+                    fault("PC escaped loaded program: PC=" + std::to_string(pc_));
+                    return;
+                }
+                else
+                {
+                    startHierarchyRequest(Stage::IF_STAGE,
+                                          HierarchyPort::Kind::FETCH,
+                                          pc_,
+                                          cachesEnabled,
+                                          0,
+                                          0,
+                                          pc_,
+                                          fetchEpoch_);
+                }
+            }
+
+            if (!idStall && !ID_.valid && IF_.valid)
+            {
+                PipeReg tmp = IF_;
+                tmp.note = "[Fetched->ID]";
+                nextID = tmp;
+                nextIF = {};
+                ++pc_;
+            }
+        }
     }
 
-    doIF(cachesEnabled, idStall);
+    IF_ = nextIF;
+    ID_ = nextID;
+    EX_ = nextEX;
+    MEM_ = nextMEM;
+    WB_ = nextWB;
 
     if (haltRequested_ &&
         !IF_.valid && !ID_.valid && !EX_.valid && !MEM_.valid && !WB_.valid &&
         !hierarchyPort_.busy)
     {
         halted_ = true;
+        lastSummary_ = "HALT retired";
+    }
+
+    if (programEndReached_ &&
+        !IF_.valid && !ID_.valid && !EX_.valid && !MEM_.valid && !WB_.valid &&
+        !hierarchyPort_.busy)
+    {
+        halted_ = true;
+        lastSummary_ = "Program completed";
     }
 
     ++cycles_;
     regs_[0] = 0;
 }
-
 void Simulator::stepSequentialCycle(bool cachesEnabled)
 {
+    if (faulted_)
+        return;
+
     lastFlags_.clear();
     stallThisCycle_ = false;
     squashThisCycle_ = false;
 
     advanceHierarchy();
+    if (faulted_)
+        return;
 
     switch (seq_.phase)
     {
@@ -721,7 +1073,23 @@ void Simulator::stepSequentialCycle(bool cachesEnabled)
             seq_.phase = SeqState::Phase::HALTED;
             break;
         }
+
         seq_.pc = pc_;
+        if (seq_.pc == programEnd())
+        {
+            programEndReached_ = true;
+            halted_ = true;
+            seq_.phase = SeqState::Phase::HALTED;
+            lastSummary_ = "Program completed";
+            break;
+        }
+
+        if (!pcInLoadedProgram(seq_.pc))
+        {
+            fault("Sequential PC escaped program: PC=" + std::to_string(seq_.pc));
+            return;
+        }
+
         if (!hierarchyPort_.busy)
         {
             startHierarchyRequest(Stage::SEQ_STAGE,
@@ -755,24 +1123,32 @@ void Simulator::stepSequentialCycle(bool cachesEnabled)
 
         if (inst.isBranch())
         {
+            uint32_t target = seq_.pc + 1;
             if (evalBranch(inst, a, b))
             {
-                pc_ = seq_.pc + 1 + static_cast<uint32_t>(inst.imm);
-                seq_.note = "Sequential branch taken";
+                target = seq_.pc + 1 + static_cast<uint32_t>(inst.imm);
             }
-            else
+            if (!pcInLoadedProgram(target))
             {
-                pc_ = seq_.pc + 1;
-                seq_.note = "Sequential branch not taken";
+                fault("Sequential branch target outside program: PC=" + std::to_string(target));
+                return;
             }
+            pc_ = target;
             seq_.phase = SeqState::Phase::IDLE;
+            seq_.note = "Sequential branch";
             lastSummary_ = seq_.note;
             break;
         }
 
         if (inst.op == Opcode::J)
         {
-            pc_ = static_cast<uint32_t>(a);
+            const uint32_t target = static_cast<uint32_t>(a);
+            if (!pcInLoadedProgram(target))
+            {
+                fault("Sequential jump target outside program: PC=" + std::to_string(target));
+                return;
+            }
+            pc_ = target;
             seq_.phase = SeqState::Phase::IDLE;
             seq_.note = "Sequential jump";
             lastSummary_ = seq_.note;
@@ -781,8 +1157,14 @@ void Simulator::stepSequentialCycle(bool cachesEnabled)
 
         if (inst.op == Opcode::JAL)
         {
+            const uint32_t target = static_cast<uint32_t>(a);
+            if (!pcInLoadedProgram(target))
+            {
+                fault("Sequential JAL target outside program: PC=" + std::to_string(target));
+                return;
+            }
             writeReg(15, static_cast<int32_t>(seq_.pc + 1));
-            pc_ = static_cast<uint32_t>(a);
+            pc_ = target;
             seq_.phase = SeqState::Phase::IDLE;
             seq_.note = "Sequential JAL";
             lastSummary_ = seq_.note;
@@ -868,9 +1250,7 @@ void Simulator::stepSequentialCycle(bool cachesEnabled)
 std::string Simulator::step()
 {
     if (halted_)
-    {
-        return "HALTED";
-    }
+        return faulted_ ? "FAULT" : "HALTED";
 
     switch (mode_)
     {
@@ -888,33 +1268,35 @@ std::string Simulator::step()
         break;
     }
 
+    if (faulted_)
+        return "FAULT";
     return halted_ ? "HALTED" : "OK";
 }
 
 std::string Simulator::run(uint64_t maxCycles)
 {
-    const uint64_t start = cycles_;
+    uint64_t start = cycles_;
 
-    while (!halted_ && (cycles_ - start) < maxCycles)
+    while (!halted_ && !faulted_ && (cycles_ - start) < maxCycles)
     {
-        if (breakpoints_.count(pc_))
-        {
-            lastSummary_ = "Breakpoint hit";
-            return "BREAKPOINT";
-        }
         step();
+        if (mode_ == ExecMode::NO_PIPE_NO_CACHE || mode_ == ExecMode::NO_PIPE_CACHE)
+        {
+            if (seq_.phase == SeqState::Phase::HALTED)
+                break;
+        }
     }
 
-    if (halted_)
-        return "HALTED";
-    return "Stopped at cycle limit";
+    if (faulted_)
+        return "FAULT";
+    return halted_ ? "HALTED" : "Stopped at cycle limit";
 }
 
 std::string Simulator::runUntilBreakpoint(uint64_t maxCycles)
 {
-    const uint64_t start = cycles_;
+    uint64_t start = cycles_;
 
-    while (!halted_ && (cycles_ - start) < maxCycles)
+    while (!halted_ && !faulted_ && (cycles_ - start) < maxCycles)
     {
         if (breakpoints_.count(pc_))
         {
@@ -922,11 +1304,16 @@ std::string Simulator::runUntilBreakpoint(uint64_t maxCycles)
             return "BREAKPOINT";
         }
         step();
+        if (mode_ == ExecMode::NO_PIPE_NO_CACHE || mode_ == ExecMode::NO_PIPE_CACHE)
+        {
+            if (seq_.phase == SeqState::Phase::HALTED)
+                break;
+        }
     }
 
-    if (halted_)
-        return "HALTED";
-    return "Stopped at cycle limit";
+    if (faulted_)
+        return "FAULT";
+    return halted_ ? "HALTED" : "Stopped at cycle limit";
 }
 
 std::string Simulator::pipeToString(const PipeReg &p) const
@@ -979,6 +1366,7 @@ SimulatorSnapshot Simulator::getSnapshot(uint32_t memStart, uint32_t memLines) c
     s.pc = pc_;
     s.halted = halted_;
     s.haltRequested = haltRequested_;
+    s.faulted = faulted_;
     s.zFlag = status_.Z;
     s.mode = modeString();
     s.regs = regs_;
@@ -989,8 +1377,8 @@ SimulatorSnapshot Simulator::getSnapshot(uint32_t memStart, uint32_t memLines) c
     s.memStage = pipeToString(MEM_);
     s.wbStage = pipeToString(WB_);
 
-    s.summary = lastSummary_;
-    s.flags = lastFlags_;
+    s.summary = faulted_ ? faultMessage_ : lastSummary_;
+    s.flags = faulted_ ? "FAULT" : lastFlags_;
     s.hierarchyState = hierarchyString();
     s.seqState = "SEQ phase: " + seqPhaseString();
 

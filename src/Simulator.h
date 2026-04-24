@@ -50,6 +50,7 @@ struct SimulatorSnapshot
     uint32_t pc = 0;
     bool halted = false;
     bool haltRequested = false;
+    bool faulted = false;
     bool zFlag = false;
     std::string mode;
     std::array<int32_t, 16> regs{};
@@ -118,6 +119,8 @@ private:
     uint32_t pc_ = 0;
     bool halted_ = false;
     bool haltRequested_ = false;
+    bool faulted_ = false;
+    bool programEndReached_ = false;
     StatusRegister status_{};
     std::array<int32_t, 16> regs_{};
 
@@ -181,6 +184,7 @@ private:
     bool squashThisCycle_ = false;
     std::string lastSummary_;
     std::string lastFlags_;
+    std::string faultMessage_;
 
     uint32_t fetchInstructionWord(uint32_t address, bool cachesEnabled, bool &stall, std::string &msg);
     Instruction fetchAndDecode(uint32_t address, bool cachesEnabled, bool &stall, std::string &msg);
@@ -222,4 +226,8 @@ private:
     std::string pipeToString(const PipeReg &p) const;
     std::string seqPhaseString() const;
     std::string hierarchyString() const;
+
+    bool pcInLoadedProgram(uint32_t pc) const;
+    uint32_t programEnd() const;
+    void fault(const std::string &message);
 };
